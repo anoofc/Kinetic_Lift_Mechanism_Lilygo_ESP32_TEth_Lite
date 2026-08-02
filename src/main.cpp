@@ -42,21 +42,45 @@ constexpr char NVS_MOTOR_1_P2_KEY[] = "m1_p2";
 constexpr char NVS_MOTOR_2_P2_KEY[] = "m2_p2";
 constexpr char NVS_P1_SAVED_KEY[] = "p1_saved";
 constexpr char NVS_P2_SAVED_KEY[] = "p2_saved";
+constexpr char NVS_MOVE_SPEED_KEY[] = "move_speed";
+constexpr char NVS_ACCELERATION_KEY[] = "acceleration";
+constexpr char NVS_DECELERATION_KEY[] = "deceleration";
+constexpr char NVS_LEGACY_POSITION_DELAY_KEY[] = "pos_delay";
+constexpr char NVS_P1_DELAY_KEY[] = "p1_delay";
+constexpr char NVS_P2_DELAY_KEY[] = "p2_delay";
 
 constexpr uint8_t DEFAULT_DEVICE_ID = 1;
 constexpr uint32_t DEFAULT_HOMING_SPEED = 1000;
 constexpr uint8_t DEFAULT_WORKING_MODE = 0;
+constexpr uint32_t DEFAULT_MOVE_SPEED = 1000;
+constexpr uint32_t DEFAULT_ACCELERATION = 1000;
+constexpr uint32_t DEFAULT_DECELERATION = 1000;
+constexpr uint32_t DEFAULT_P1_DELAY_MS = 1000;
+constexpr uint32_t DEFAULT_P2_DELAY_MS = 1000;
 constexpr uint8_t MIN_DEVICE_ID = 1;
 constexpr uint8_t MAX_DEVICE_ID = 255;
 constexpr uint32_t MIN_HOMING_SPEED = 1;
 constexpr uint32_t MAX_HOMING_SPEED = 5000;
 constexpr uint8_t MIN_WORKING_MODE = 0;
 constexpr uint8_t MAX_WORKING_MODE = 3;
+constexpr uint8_t AUTO_WORKING_MODE = 2;
 constexpr uint8_t JOG_WORKING_MODE = 3;
+constexpr uint32_t MIN_MOVE_SPEED = 1;
+constexpr uint32_t MAX_MOVE_SPEED = 5000;
+constexpr uint32_t MIN_ACCELERATION = 1;
+constexpr uint32_t MAX_ACCELERATION = 50000;
+constexpr uint32_t MIN_DECELERATION = 1;
+constexpr uint32_t MAX_DECELERATION = 50000;
+constexpr uint32_t MAX_ENDPOINT_DELAY_MS = 600000;
 
 uint8_t device_id = DEFAULT_DEVICE_ID;
 uint32_t motor_homing_speed = DEFAULT_HOMING_SPEED; // Steps per second.
 uint8_t working_mode = DEFAULT_WORKING_MODE;
+uint32_t move_speed = DEFAULT_MOVE_SPEED; // Master steps per second.
+uint32_t acceleration = DEFAULT_ACCELERATION; // Master steps per second squared.
+uint32_t deceleration = DEFAULT_DECELERATION; // Master steps per second squared.
+uint32_t p1_delay_ms = DEFAULT_P1_DELAY_MS;
+uint32_t p2_delay_ms = DEFAULT_P2_DELAY_MS;
 bool preferences_ready = false;
 
 // Working modes: 0 Home, 1 Manual (Bluetooth), 2 Auto (looping through a sequence of positions), 3 Jog (Bluetooth)
@@ -75,6 +99,7 @@ constexpr uint32_t HOMING_TIMEOUT_MS = 30000;
 constexpr uint32_t JOG_SPEED = 250; // Steps per second.
 constexpr uint32_t DEFAULT_JOG_STEPS = 10;
 constexpr uint32_t MAX_JOG_STEPS = 10000;
+constexpr float MIN_PROFILE_SPEED = 10.0F;
 constexpr uint8_t BT_MAX_BYTES_PER_LOOP = 64;
 constexpr size_t BT_MAX_COMMAND_LENGTH = 128;
 
@@ -108,11 +133,42 @@ bool jog_pulse_high = false;
 uint32_t last_jog_step_us = 0;
 uint32_t jog_pulse_started_us = 0;
 
+enum class AutoState : uint8_t {
+  IDLE,
+  WAITING_FOR_POSITIONS,
+  MOVING_TO_P1,
+  WAITING_AT_P1,
+  MOVING_TO_P2,
+  WAITING_AT_P2,
+  FAULT
+};
+
+AutoState auto_state = AutoState::IDLE;
+int32_t auto_motor_1_target = 0;
+int32_t auto_motor_2_target = 0;
+int8_t auto_motor_1_direction = 0;
+int8_t auto_motor_2_direction = 0;
+uint32_t auto_motor_1_steps = 0;
+uint32_t auto_motor_2_steps = 0;
+uint32_t auto_total_master_steps = 0;
+uint32_t auto_master_steps_completed = 0;
+uint32_t auto_motor_1_accumulator = 0;
+uint32_t auto_motor_2_accumulator = 0;
+bool auto_motor_1_pulse_high = false;
+bool auto_motor_2_pulse_high = false;
+bool auto_pulse_high = false;
+bool auto_target_is_p1 = true;
+uint32_t last_auto_step_us = 0;
+uint32_t auto_pulse_started_us = 0;
+uint32_t auto_position_reached_ms = 0;
+
 void stopJog();
 bool startJog(bool jog_motor_1, bool jog_motor_2,
               JogDirection direction, uint32_t steps);
 void processJogCommand(String arguments);
 void processSavePositionCommand(String arguments);
+void stopAutoMode();
+void resetAutoMode();
 
 
 // BLUETOOTH SERIAL FUNCTIONS
@@ -121,6 +177,11 @@ void sendConfiguration() {
   SerialBT.println("DEVICE_ID=" + String(device_id));
   SerialBT.println("HOMING_SPEED=" + String(motor_homing_speed) + " steps/s");
   SerialBT.println("WORKING_MODE=" + String(working_mode));
+  SerialBT.println("MOVE_SPEED=" + String(move_speed) + " steps/s");
+  SerialBT.println("ACCELERATION=" + String(acceleration) + " steps/s^2");
+  SerialBT.println("DECELERATION=" + String(deceleration) + " steps/s^2");
+  SerialBT.println("P1_DELAY=" + String(p1_delay_ms) + " ms");
+  SerialBT.println("P2_DELAY=" + String(p2_delay_ms) + " ms");
   SerialBT.println("MOTOR_1_POSITION=" + String(motor_1_position));
   SerialBT.println("MOTOR_2_POSITION=" + String(motor_2_position));
   SerialBT.println("P1=" + String(p1_saved ? "SET" : "NOT_SET") +
@@ -167,6 +228,31 @@ bool saveHomingSpeed(uint32_t value) {
 bool saveWorkingMode(uint8_t value) {
   return preferences_ready &&
          pref.putUChar(NVS_WORKING_MODE_KEY, value) == sizeof(value);
+}
+
+bool saveMoveSpeed(uint32_t value) {
+  return preferences_ready &&
+         pref.putUInt(NVS_MOVE_SPEED_KEY, value) == sizeof(value);
+}
+
+bool saveAcceleration(uint32_t value) {
+  return preferences_ready &&
+         pref.putUInt(NVS_ACCELERATION_KEY, value) == sizeof(value);
+}
+
+bool saveDeceleration(uint32_t value) {
+  return preferences_ready &&
+         pref.putUInt(NVS_DECELERATION_KEY, value) == sizeof(value);
+}
+
+bool saveP1Delay(uint32_t value) {
+  return preferences_ready &&
+         pref.putUInt(NVS_P1_DELAY_KEY, value) == sizeof(value);
+}
+
+bool saveP2Delay(uint32_t value) {
+  return preferences_ready &&
+         pref.putUInt(NVS_P2_DELAY_KEY, value) == sizeof(value);
 }
 
 bool savePositionPair(bool save_p1) {
@@ -306,6 +392,95 @@ void processData(String data) {
     return;
   }
 
+  if (parameter.equalsIgnoreCase("MOVE_SPEED")) {
+    if (value < MIN_MOVE_SPEED || value > MAX_MOVE_SPEED) {
+      SerialBT.println("ERROR: MOVE_SPEED range is 1-5000 steps/s");
+      return;
+    }
+    if (value != move_speed && !saveMoveSpeed(value)) {
+      SerialBT.println("ERROR: Failed to save MOVE_SPEED to NVS");
+      return;
+    }
+    move_speed = value;
+    SerialBT.println("OK: MOVE_SPEED=" + String(move_speed) + " steps/s");
+    return;
+  }
+
+  if (parameter.equalsIgnoreCase("ACCELERATION")) {
+    if (value < MIN_ACCELERATION || value > MAX_ACCELERATION) {
+      SerialBT.println("ERROR: ACCELERATION range is 1-50000 steps/s^2");
+      return;
+    }
+    if (value != acceleration && !saveAcceleration(value)) {
+      SerialBT.println("ERROR: Failed to save ACCELERATION to NVS");
+      return;
+    }
+    acceleration = value;
+    SerialBT.println("OK: ACCELERATION=" + String(acceleration) +
+                     " steps/s^2");
+    return;
+  }
+
+  if (parameter.equalsIgnoreCase("DECELERATION")) {
+    if (value < MIN_DECELERATION || value > MAX_DECELERATION) {
+      SerialBT.println("ERROR: DECELERATION range is 1-50000 steps/s^2");
+      return;
+    }
+    if (value != deceleration && !saveDeceleration(value)) {
+      SerialBT.println("ERROR: Failed to save DECELERATION to NVS");
+      return;
+    }
+    deceleration = value;
+    SerialBT.println("OK: DECELERATION=" + String(deceleration) +
+                     " steps/s^2");
+    return;
+  }
+
+  if (parameter.equalsIgnoreCase("P1_DELAY")) {
+    if (value > MAX_ENDPOINT_DELAY_MS) {
+      SerialBT.println("ERROR: P1_DELAY range is 0-600000 ms");
+      return;
+    }
+    if (value != p1_delay_ms && !saveP1Delay(value)) {
+      SerialBT.println("ERROR: Failed to save P1_DELAY to NVS");
+      return;
+    }
+    p1_delay_ms = value;
+    SerialBT.println("OK: P1_DELAY=" + String(p1_delay_ms) + " ms");
+    return;
+  }
+
+  if (parameter.equalsIgnoreCase("P2_DELAY")) {
+    if (value > MAX_ENDPOINT_DELAY_MS) {
+      SerialBT.println("ERROR: P2_DELAY range is 0-600000 ms");
+      return;
+    }
+    if (value != p2_delay_ms && !saveP2Delay(value)) {
+      SerialBT.println("ERROR: Failed to save P2_DELAY to NVS");
+      return;
+    }
+    p2_delay_ms = value;
+    SerialBT.println("OK: P2_DELAY=" + String(p2_delay_ms) + " ms");
+    return;
+  }
+
+  if (parameter.equalsIgnoreCase("POSITION_DELAY")) {
+    if (value > MAX_ENDPOINT_DELAY_MS) {
+      SerialBT.println("ERROR: POSITION_DELAY range is 0-600000 ms");
+      return;
+    }
+    const bool p1_saved_ok = value == p1_delay_ms || saveP1Delay(value);
+    const bool p2_saved_ok = value == p2_delay_ms || saveP2Delay(value);
+    if (!p1_saved_ok || !p2_saved_ok) {
+      SerialBT.println("ERROR: Failed to save both endpoint delays to NVS");
+      return;
+    }
+    p1_delay_ms = value;
+    p2_delay_ms = value;
+    SerialBT.println("OK: P1_DELAY and P2_DELAY=" + String(value) + " ms");
+    return;
+  }
+
   if (parameter.equalsIgnoreCase("WORKING_MODE")) {
     if (value < MIN_WORKING_MODE || value > MAX_WORKING_MODE) {
       SerialBT.println("ERROR: WORKING_MODE range is 0-3 (3=Jog)");
@@ -317,15 +492,19 @@ void processData(String data) {
       SerialBT.println("ERROR: Failed to save WORKING_MODE to NVS");
       return;
     }
-    working_mode = new_working_mode;
-    if (working_mode != JOG_WORKING_MODE) {
+    if (new_working_mode != working_mode) {
       stopJog();
+      stopAutoMode();
+    }
+    working_mode = new_working_mode;
+    if (working_mode == AUTO_WORKING_MODE) {
+      resetAutoMode();
     }
     SerialBT.println("OK: WORKING_MODE=" + String(working_mode));
     return;
   }
 
-  SerialBT.println("ERROR: Parameter must be DEVICE_ID, HOMING_SPEED, or WORKING_MODE");
+  SerialBT.println("ERROR: Unknown configuration parameter");
 }
 
 void readBTSerial() {
@@ -374,6 +553,13 @@ void initializeParameters() {
   motor_homing_speed =
       pref.getUInt(NVS_HOMING_SPEED_KEY, DEFAULT_HOMING_SPEED);
   working_mode = pref.getUChar(NVS_WORKING_MODE_KEY, DEFAULT_WORKING_MODE);
+  move_speed = pref.getUInt(NVS_MOVE_SPEED_KEY, DEFAULT_MOVE_SPEED);
+  acceleration = pref.getUInt(NVS_ACCELERATION_KEY, DEFAULT_ACCELERATION);
+  deceleration = pref.getUInt(NVS_DECELERATION_KEY, DEFAULT_DECELERATION);
+  const uint32_t legacy_position_delay = pref.getUInt(
+      NVS_LEGACY_POSITION_DELAY_KEY, DEFAULT_P1_DELAY_MS);
+  p1_delay_ms = pref.getUInt(NVS_P1_DELAY_KEY, legacy_position_delay);
+  p2_delay_ms = pref.getUInt(NVS_P2_DELAY_KEY, legacy_position_delay);
   motor_1_p1 = pref.getInt(NVS_MOTOR_1_P1_KEY, 0);
   motor_2_p1 = pref.getInt(NVS_MOTOR_2_P1_KEY, 0);
   motor_1_p2 = pref.getInt(NVS_MOTOR_1_P2_KEY, 0);
@@ -400,6 +586,41 @@ void initializeParameters() {
     working_mode = DEFAULT_WORKING_MODE;
     if (!saveWorkingMode(working_mode)) {
       Serial.println("CRITICAL: Failed to repair WORKING_MODE in NVS.");
+    }
+  }
+
+  if (move_speed < MIN_MOVE_SPEED || move_speed > MAX_MOVE_SPEED) {
+    move_speed = DEFAULT_MOVE_SPEED;
+    if (!saveMoveSpeed(move_speed)) {
+      Serial.println("CRITICAL: Failed to repair MOVE_SPEED in NVS.");
+    }
+  }
+
+  if (acceleration < MIN_ACCELERATION || acceleration > MAX_ACCELERATION) {
+    acceleration = DEFAULT_ACCELERATION;
+    if (!saveAcceleration(acceleration)) {
+      Serial.println("CRITICAL: Failed to repair ACCELERATION in NVS.");
+    }
+  }
+
+  if (deceleration < MIN_DECELERATION || deceleration > MAX_DECELERATION) {
+    deceleration = DEFAULT_DECELERATION;
+    if (!saveDeceleration(deceleration)) {
+      Serial.println("CRITICAL: Failed to repair DECELERATION in NVS.");
+    }
+  }
+
+  if (p1_delay_ms > MAX_ENDPOINT_DELAY_MS) {
+    p1_delay_ms = DEFAULT_P1_DELAY_MS;
+    if (!saveP1Delay(p1_delay_ms)) {
+      Serial.println("CRITICAL: Failed to repair P1_DELAY in NVS.");
+    }
+  }
+
+  if (p2_delay_ms > MAX_ENDPOINT_DELAY_MS) {
+    p2_delay_ms = DEFAULT_P2_DELAY_MS;
+    if (!saveP2Delay(p2_delay_ms)) {
+      Serial.println("CRITICAL: Failed to repair P2_DELAY in NVS.");
     }
   }
 
@@ -434,8 +655,10 @@ String takeFirstToken(String &text) {
 }
 
 void stopJog() {
-  digitalWrite(MOTOR_1_PUL, LOW);
-  digitalWrite(MOTOR_2_PUL, LOW);
+  if (motor_1_jogging || motor_2_jogging || jog_pulse_high) {
+    digitalWrite(MOTOR_1_PUL, LOW);
+    digitalWrite(MOTOR_2_PUL, LOW);
+  }
   motor_1_jogging = false;
   motor_2_jogging = false;
   motor_1_jog_steps_remaining = 0;
@@ -677,6 +900,262 @@ void updateJog() {
   jog_pulse_high = true;
 }
 
+// AUTOMATIC P1/P2 LOOP FUNCTIONS
+
+bool autoPositionsAreValid() {
+  return p1_saved && p2_saved && motor_1_p1 >= 0 && motor_2_p1 >= 0 &&
+         motor_1_p2 > motor_1_p1 && motor_2_p2 > motor_2_p1;
+}
+
+bool autoMoveIsActive() {
+  return auto_state == AutoState::MOVING_TO_P1 ||
+         auto_state == AutoState::MOVING_TO_P2 || auto_pulse_high;
+}
+
+void stopAutoMode() {
+  if (autoMoveIsActive()) {
+    digitalWrite(MOTOR_1_PUL, LOW);
+    digitalWrite(MOTOR_2_PUL, LOW);
+  }
+
+  auto_pulse_high = false;
+  auto_motor_1_pulse_high = false;
+  auto_motor_2_pulse_high = false;
+  auto_total_master_steps = 0;
+  auto_master_steps_completed = 0;
+  auto_state = AutoState::IDLE;
+}
+
+void resetAutoMode() {
+  stopAutoMode();
+  auto_state = AutoState::IDLE;
+}
+
+void setAutoFault(const char *message) {
+  if (autoMoveIsActive()) {
+    digitalWrite(MOTOR_1_PUL, LOW);
+    digitalWrite(MOTOR_2_PUL, LOW);
+  }
+  auto_pulse_high = false;
+  auto_motor_1_pulse_high = false;
+  auto_motor_2_pulse_high = false;
+  auto_state = AutoState::FAULT;
+
+  // Unexpected limit activation is critical and prints regardless of DEBUG.
+  Serial.println(message);
+  SerialBT.println(message);
+}
+
+void completeAutoMove() {
+  digitalWrite(MOTOR_1_PUL, LOW);
+  digitalWrite(MOTOR_2_PUL, LOW);
+  motor_1_position = auto_motor_1_target;
+  motor_2_position = auto_motor_2_target;
+  auto_pulse_high = false;
+  auto_motor_1_pulse_high = false;
+  auto_motor_2_pulse_high = false;
+  auto_position_reached_ms = millis();
+  auto_state = auto_target_is_p1 ? AutoState::WAITING_AT_P1
+                                 : AutoState::WAITING_AT_P2;
+
+  SerialBT.println("AUTO_REACHED: " + String(auto_target_is_p1 ? "P1" : "P2") +
+                   " M1=" + String(motor_1_position) +
+                   " M2=" + String(motor_2_position));
+  DEBUG_PRINTLN("Automatic move reached target position.");
+}
+
+void startAutoMove(int32_t motor_1_target, int32_t motor_2_target,
+                   bool target_is_p1) {
+  auto_motor_1_target = motor_1_target;
+  auto_motor_2_target = motor_2_target;
+  auto_target_is_p1 = target_is_p1;
+
+  const int64_t motor_1_delta =
+      static_cast<int64_t>(motor_1_target) - motor_1_position;
+  const int64_t motor_2_delta =
+      static_cast<int64_t>(motor_2_target) - motor_2_position;
+  auto_motor_1_direction = (motor_1_delta > 0) - (motor_1_delta < 0);
+  auto_motor_2_direction = (motor_2_delta > 0) - (motor_2_delta < 0);
+  auto_motor_1_steps = static_cast<uint32_t>(
+      motor_1_delta < 0 ? -motor_1_delta : motor_1_delta);
+  auto_motor_2_steps = static_cast<uint32_t>(
+      motor_2_delta < 0 ? -motor_2_delta : motor_2_delta);
+  auto_total_master_steps =
+      max(auto_motor_1_steps, auto_motor_2_steps);
+  auto_master_steps_completed = 0;
+  auto_motor_1_accumulator = 0;
+  auto_motor_2_accumulator = 0;
+  auto_pulse_high = false;
+  auto_motor_1_pulse_high = false;
+  auto_motor_2_pulse_high = false;
+
+  if (auto_motor_1_direction != 0) {
+    digitalWrite(MOTOR_1_DIR,
+                 auto_motor_1_direction < 0
+                     ? MOTOR_1_HOMING_DIRECTION
+                     : !MOTOR_1_HOMING_DIRECTION);
+  }
+  if (auto_motor_2_direction != 0) {
+    digitalWrite(MOTOR_2_DIR,
+                 auto_motor_2_direction < 0
+                     ? MOTOR_2_HOMING_DIRECTION
+                     : !MOTOR_2_HOMING_DIRECTION);
+  }
+
+  auto_state = target_is_p1 ? AutoState::MOVING_TO_P1
+                            : AutoState::MOVING_TO_P2;
+  last_auto_step_us = micros();
+
+  if (auto_total_master_steps == 0) {
+    completeAutoMove();
+  } else {
+    SerialBT.println("AUTO_MOVING_TO: " + String(target_is_p1 ? "P1" : "P2"));
+  }
+}
+
+uint32_t calculateAutoStepIntervalUs() {
+  const uint32_t steps_remaining =
+      auto_total_master_steps - auto_master_steps_completed;
+  const float acceleration_speed =
+      sqrtf(2.0F * static_cast<float>(acceleration) *
+            static_cast<float>(auto_master_steps_completed + 1));
+  const float deceleration_speed =
+      sqrtf(2.0F * static_cast<float>(deceleration) *
+            static_cast<float>(steps_remaining));
+  float profile_speed = min(static_cast<float>(move_speed),
+                            min(acceleration_speed, deceleration_speed));
+  const float minimum_speed =
+      min(static_cast<float>(move_speed), MIN_PROFILE_SPEED);
+  profile_speed = max(profile_speed, minimum_speed);
+  return static_cast<uint32_t>(1000000.0F / profile_speed);
+}
+
+void updateAutoMove() {
+  if (auto_motor_1_direction < 0 && isMotor1LimitTriggered()) {
+    if (auto_motor_1_target != 0) {
+      setAutoFault("CRITICAL: Motor 1 limit triggered before automatic target.");
+      return;
+    }
+    motor_1_position = 0;
+    auto_motor_1_direction = 0;
+    auto_motor_1_steps = 0;
+    auto_motor_1_accumulator = 0;
+    digitalWrite(MOTOR_1_PUL, LOW);
+    auto_motor_1_pulse_high = false;
+  }
+
+  if (auto_motor_2_direction < 0 && isMotor2LimitTriggered()) {
+    if (auto_motor_2_target != 0) {
+      setAutoFault("CRITICAL: Motor 2 limit triggered before automatic target.");
+      return;
+    }
+    motor_2_position = 0;
+    auto_motor_2_direction = 0;
+    auto_motor_2_steps = 0;
+    auto_motor_2_accumulator = 0;
+    digitalWrite(MOTOR_2_PUL, LOW);
+    auto_motor_2_pulse_high = false;
+  }
+
+  const uint32_t now_us = micros();
+  if (auto_pulse_high) {
+    if (now_us - auto_pulse_started_us >= STEP_PULSE_WIDTH_US) {
+      if (auto_motor_1_pulse_high) {
+        digitalWrite(MOTOR_1_PUL, LOW);
+      }
+      if (auto_motor_2_pulse_high) {
+        digitalWrite(MOTOR_2_PUL, LOW);
+      }
+      auto_motor_1_pulse_high = false;
+      auto_motor_2_pulse_high = false;
+      auto_pulse_high = false;
+    }
+    return;
+  }
+
+  if (auto_master_steps_completed >= auto_total_master_steps) {
+    completeAutoMove();
+    return;
+  }
+
+  const uint32_t step_interval_us = calculateAutoStepIntervalUs();
+  if (now_us - last_auto_step_us < step_interval_us) {
+    return;
+  }
+
+  if (auto_motor_1_direction != 0) {
+    auto_motor_1_accumulator += auto_motor_1_steps;
+    if (auto_motor_1_accumulator >= auto_total_master_steps) {
+      auto_motor_1_accumulator -= auto_total_master_steps;
+      digitalWrite(MOTOR_1_PUL, HIGH);
+      auto_motor_1_pulse_high = true;
+      motor_1_position += auto_motor_1_direction;
+    }
+  }
+
+  if (auto_motor_2_direction != 0) {
+    auto_motor_2_accumulator += auto_motor_2_steps;
+    if (auto_motor_2_accumulator >= auto_total_master_steps) {
+      auto_motor_2_accumulator -= auto_total_master_steps;
+      digitalWrite(MOTOR_2_PUL, HIGH);
+      auto_motor_2_pulse_high = true;
+      motor_2_position += auto_motor_2_direction;
+    }
+  }
+
+  ++auto_master_steps_completed;
+  last_auto_step_us = now_us;
+  auto_pulse_started_us = now_us;
+  auto_pulse_high = auto_motor_1_pulse_high || auto_motor_2_pulse_high;
+}
+
+void updateAutoMode() {
+  if (working_mode != AUTO_WORKING_MODE) {
+    if (auto_state != AutoState::IDLE) {
+      stopAutoMode();
+    }
+    return;
+  }
+
+  if (homing_state != HomingState::COMPLETE || auto_state == AutoState::FAULT) {
+    return;
+  }
+
+  if (auto_state == AutoState::IDLE) {
+    if (!autoPositionsAreValid()) {
+      auto_state = AutoState::WAITING_FOR_POSITIONS;
+      SerialBT.println("AUTO_WAITING: Valid P1 and P2 positions are required");
+      return;
+    }
+    startAutoMove(motor_1_p1, motor_2_p1, true);
+    return;
+  }
+
+  if (auto_state == AutoState::WAITING_FOR_POSITIONS) {
+    if (autoPositionsAreValid()) {
+      startAutoMove(motor_1_p1, motor_2_p1, true);
+    }
+    return;
+  }
+
+  if (auto_state == AutoState::MOVING_TO_P1 ||
+      auto_state == AutoState::MOVING_TO_P2) {
+    updateAutoMove();
+    return;
+  }
+
+  if (auto_state == AutoState::WAITING_AT_P1 &&
+      millis() - auto_position_reached_ms >= p1_delay_ms) {
+    startAutoMove(motor_1_p2, motor_2_p2, false);
+    return;
+  }
+
+  if (auto_state == AutoState::WAITING_AT_P2 &&
+      millis() - auto_position_reached_ms >= p2_delay_ms) {
+    startAutoMove(motor_1_p1, motor_2_p1, true);
+  }
+}
+
 void stopHomingWithFault(const char *message) {
   digitalWrite(MOTOR_1_PUL, LOW);
   digitalWrite(MOTOR_2_PUL, LOW);
@@ -701,6 +1180,7 @@ void finishHoming() {
 
 void startHoming() {
   stopJog();
+  stopAutoMode();
   digitalWrite(MOTOR_1_PUL, LOW);
   digitalWrite(MOTOR_2_PUL, LOW);
   digitalWrite(MOTOR_1_DIR, MOTOR_1_HOMING_DIRECTION);
@@ -811,6 +1291,7 @@ void setup() {
 
 void loop() {
   updateHoming();
+  updateAutoMode();
   updateJog();
   readBTSerial();
 }

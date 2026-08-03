@@ -116,6 +116,7 @@ bool p2_saved = false;
 
 constexpr uint32_t STEP_PULSE_WIDTH_US = 10;
 constexpr uint32_t HOMING_TIMEOUT_MS = 30000;
+constexpr uint32_t LIMIT_TRIGGER_REHOME_DELAY_MS = 5000;
 constexpr uint32_t DEFAULT_JOG_STEPS = 10;
 constexpr uint32_t MAX_JOG_STEPS = MAX_TRAVEL_STEPS;
 constexpr float MIN_PROFILE_SPEED = 10.0F;
@@ -134,6 +135,10 @@ bool homing_pulse_high = false;
 uint32_t homing_started_ms = 0;
 uint32_t last_homing_step_us = 0;
 uint32_t homing_pulse_started_us = 0;
+bool previous_motor_1_limit_triggered = false;
+bool previous_motor_2_limit_triggered = false;
+bool limit_rehome_pending = false;
+uint32_t limit_rehome_requested_ms = 0;
 
 enum class JogDirection : int8_t {
   HOME = -1,
@@ -192,6 +197,8 @@ bool startSavedPositionMove(bool target_is_p1);
 void startAutoMove(int32_t motor_1_target, int32_t motor_2_target,
                    bool target_is_p1);
 void startHoming();
+void monitorMovementLimitSwitches();
+void updateDelayedRehoming();
 
 
 // BLUETOOTH SERIAL FUNCTIONS
@@ -557,10 +564,12 @@ void processData(String data) {
     working_mode = new_working_mode;
     if (working_mode == AUTO_WORKING_MODE) {
       resetAutoMode();
-    } else if (working_mode == 0 &&
-               homing_state == HomingState::COMPLETE &&
-               !startSavedPositionMove(true)) {
-      SerialBT.println("MODE_0_WAITING: A valid P1 position is required");
+    } else if (working_mode == 0 && homing_state == HomingState::COMPLETE) {
+      if (limit_rehome_pending) {
+        SerialBT.println("MODE_0_WAITING: Homing is pending");
+      } else if (!startSavedPositionMove(true)) {
+        SerialBT.println("MODE_0_WAITING: A valid P1 position is required");
+      }
     }
     SerialBT.println("OK: WORKING_MODE=" + String(working_mode));
     return;
@@ -688,6 +697,41 @@ bool isMotor2LimitTriggered() {
   return digitalRead(MOTOR_2_LIMIT) == MOTOR_2_LIMIT_ACTIVE_STATE;
 }
 
+void scheduleHomingAfterLimitTrigger() {
+  stopJog();
+  stopAutoMode();
+  limit_rehome_pending = true;
+  limit_rehome_requested_ms = millis();
+
+  DEBUG_PRINTLN("Limit triggered during movement. Delayed homing scheduled.");
+  SerialBT.println("LIMIT_TRIGGERED: Motors stopped; homing in " +
+                   String(LIMIT_TRIGGER_REHOME_DELAY_MS) + " ms");
+}
+
+void monitorMovementLimitSwitches() {
+  const bool motor_1_limit_triggered = isMotor1LimitTriggered();
+  const bool motor_2_limit_triggered = isMotor2LimitTriggered();
+  const bool movement_active = autoMoveIsActive() || motor_1_jogging ||
+                               motor_2_jogging || jog_pulse_high;
+
+  if (!limit_rehome_pending && homing_state != HomingState::RUNNING &&
+      movement_active &&
+      ((motor_1_limit_triggered && !previous_motor_1_limit_triggered) ||
+       (motor_2_limit_triggered && !previous_motor_2_limit_triggered))) {
+    scheduleHomingAfterLimitTrigger();
+  }
+
+  previous_motor_1_limit_triggered = motor_1_limit_triggered;
+  previous_motor_2_limit_triggered = motor_2_limit_triggered;
+}
+
+void updateDelayedRehoming() {
+  if (limit_rehome_pending &&
+      millis() - limit_rehome_requested_ms >= LIMIT_TRIGGER_REHOME_DELAY_MS) {
+    startHoming();
+  }
+}
+
 // JOGGING FUNCTIONS
 
 String takeFirstToken(String &text) {
@@ -811,6 +855,11 @@ void processJogCommand(String arguments) {
     return;
   }
 
+  if (limit_rehome_pending) {
+    SerialBT.println("ERROR: Jogging is unavailable while homing is pending");
+    return;
+  }
+
   if (autoMoveIsActive()) {
     SerialBT.println("ERROR: Wait for the P1/P2 positioning move to finish");
     return;
@@ -874,6 +923,10 @@ void processSavePositionCommand(String arguments) {
   }
   if (homing_state != HomingState::COMPLETE) {
     SerialBT.println("ERROR: Positions cannot be saved until homing completes");
+    return;
+  }
+  if (limit_rehome_pending) {
+    SerialBT.println("ERROR: Positions cannot be saved while homing is pending");
     return;
   }
   if (motor_1_jogging || motor_2_jogging || jog_pulse_high) {
@@ -1036,7 +1089,7 @@ void resetAutoMode() {
 }
 
 bool startSavedPositionMove(bool target_is_p1) {
-  if (homing_state != HomingState::COMPLETE ||
+  if (homing_state != HomingState::COMPLETE || limit_rehome_pending ||
       (target_is_p1 ? !p1PositionIsValid() : !p2PositionIsValid())) {
     return false;
   }
@@ -1336,6 +1389,7 @@ void finishHoming() {
 }
 
 void startHoming() {
+  limit_rehome_pending = false;
   stopJog();
   stopAutoMode();
   digitalWrite(MOTOR_1_PUL, LOW);
@@ -1345,6 +1399,8 @@ void startHoming() {
 
   motor_1_homing = !isMotor1LimitTriggered();
   motor_2_homing = !isMotor2LimitTriggered();
+  previous_motor_1_limit_triggered = !motor_1_homing;
+  previous_motor_2_limit_triggered = !motor_2_homing;
   homing_pulse_high = false;
   homing_started_ms = millis();
   last_homing_step_us = micros();
@@ -1447,8 +1503,12 @@ void setup() {
 
 
 void loop() {
+  monitorMovementLimitSwitches();
+  updateDelayedRehoming();
   updateHoming();
-  updateAutoMode();
-  updateJog();
+  if (!limit_rehome_pending) {
+    updateAutoMode();
+    updateJog();
+  }
   readBTSerial();
 }

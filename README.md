@@ -77,6 +77,13 @@ reached. A 30-second homing timeout stops both motors and reports a critical
 fault. If P1 has not been calibrated, the mechanism remains at home and reports
 that a valid P1 position is required.
 
+If either home-limit switch becomes newly active during Jog, GOTO, or Automatic
+movement, both motors stop immediately. The firmware waits 500 ms without
+blocking and then starts synchronized homing. Switch activation is edge-detected,
+so a switch that is already held at home can be released normally when beginning
+an AWAY move. Jog, GOTO, and position-save commands are unavailable while this
+delayed homing is pending.
+
 ## Working modes
 
 | Value | Mode | Current behavior |

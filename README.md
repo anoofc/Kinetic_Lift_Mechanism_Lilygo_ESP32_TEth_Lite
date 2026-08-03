@@ -103,7 +103,7 @@ delayed homing is pending.
 | Value | Mode | Current behavior |
 | ---: | --- | --- |
 | 0 | Standby/P1 | Moves to P1 when enabled and accepts manual `GOTO` commands |
-| 1 | OSC control | Reserved for the upcoming UDP OSC position commands |
+| 1 | OSC control | Moves to P1 or P2 from device-addressed UDP OSC messages |
 | 2 | Automatic | Continuously moves P1 → P2 → P1 with independent endpoint delays |
 | 3 | Jog | Bluetooth synchronized or individual finite-step adjustment |
 
@@ -208,8 +208,46 @@ GET CONFIG
 ```
 
 Ethernet startup does not wait for a physical link, so it does not delay the
-non-blocking homing sequence. OSC command parsing is added separately as part of
-working mode `1`; this stage only prepares Ethernet and the UDP socket.
+non-blocking homing sequence.
+
+## OSC control mode
+
+Working mode `1` accepts device-addressed position triggers on the configured
+`UDP_IN_PORT`. Select it through Bluetooth:
+
+```text
+SET WORKING_MODE 1
+```
+
+Use these OSC addresses, replacing `<deviceID>` with the configured numeric
+`DEVICE_ID`:
+
+```text
+/trigger/<deviceID>/p1
+/trigger/<deviceID>/p2
+```
+
+For example, device ID `1` responds to:
+
+```text
+/trigger/1/p1
+/trigger/1/p2
+```
+
+Position triggers for other device IDs are ignored. They are also ignored
+outside working mode `1`, before homing has completed, or when the requested
+position has not been calibrated. OSC processing is non-blocking and motor-step
+updates run before checking for a new UDP packet.
+
+The separate device-addressed restart command is:
+
+```text
+/restart/<deviceID>
+```
+
+For example, `/restart/1` restarts only device ID `1`. Restart is an
+administrative command and is accepted in every working mode. Incoming OSC
+messages larger than 256 bytes or containing invalid OSC data are discarded.
 
 ## Jog mode and endpoint calibration
 

@@ -72,6 +72,7 @@ constexpr uint32_t DEFAULT_P1_DELAY_MS = 1000;
 constexpr uint32_t DEFAULT_P2_DELAY_MS = 1000;
 constexpr uint16_t DEFAULT_UDP_IN_PORT = 8000;
 constexpr uint16_t DEFAULT_UDP_OUT_PORT = 8001;
+constexpr int MAX_OSC_PACKET_SIZE = 256;
 
 constexpr uint32_t STEPS_PER_REVOLUTION = 6400;
 constexpr uint32_t LEAD_SCREW_LEAD_MM = 4;
@@ -223,6 +224,8 @@ void monitorMovementLimitSwitches();
 void updateDelayedRehoming();
 bool initializeEthernet();
 bool initializeUDP();
+void readOSC();
+void processOSCMessage(OSCMessage &message);
 
 
 // BLUETOOTH SERIAL FUNCTIONS
@@ -955,6 +958,90 @@ bool initializeEthernet() {
   DEBUG_PRINTLN(udp_out_port);
 
   return initializeUDP();
+}
+
+void processOSCMessage(OSCMessage &message) {
+  const String osc_address = message.getAddress();
+  const String addressed_device = String('/') + String(device_id);
+  const String restart_address = "/restart" + addressed_device;
+
+  DEBUG_PRINT("OSC received: ");
+  DEBUG_PRINTLN(osc_address);
+
+  // Restart is an administrative command and remains available in every mode.
+  if (osc_address == restart_address) {
+    DEBUG_PRINTLN("Device-addressed OSC restart requested.");
+    stopJog();
+    stopAutoMode();
+    digitalWrite(MOTOR_1_PUL, LOW);
+    digitalWrite(MOTOR_2_PUL, LOW);
+    ESP.restart();
+    return;
+  }
+
+  const String trigger_prefix = "/trigger" + addressed_device + "/";
+  if (!osc_address.startsWith(trigger_prefix)) {
+    return;
+  }
+
+  if (working_mode != 1) {
+    DEBUG_PRINTLN("OSC position trigger ignored outside working mode 1.");
+    return;
+  }
+
+  const String position = osc_address.substring(trigger_prefix.length());
+  const bool target_is_p1 = position == "p1";
+  const bool target_is_p2 = position == "p2";
+  if (!target_is_p1 && !target_is_p2) {
+    DEBUG_PRINTLN("Unknown OSC position trigger ignored.");
+    return;
+  }
+
+  if (!startSavedPositionMove(target_is_p1)) {
+    DEBUG_PRINTLN(
+        "OSC trigger ignored: homing incomplete or position not calibrated.");
+    return;
+  }
+
+  DEBUG_PRINT("OSC moving to ");
+  DEBUG_PRINTLN(target_is_p1 ? "P1" : "P2");
+}
+
+void readOSC() {
+  if (!udp_initialized) {
+    return;
+  }
+
+  int packet_size = osc_udp.parsePacket();
+  if (packet_size <= 0) {
+    return;
+  }
+
+  if (packet_size > MAX_OSC_PACKET_SIZE) {
+    while (osc_udp.available() > 0) {
+      osc_udp.read();
+    }
+    DEBUG_PRINTLN("Oversized OSC packet ignored.");
+    return;
+  }
+
+  OSCMessage message;
+  while (packet_size-- > 0) {
+    const int incoming_byte = osc_udp.read();
+    if (incoming_byte < 0) {
+      DEBUG_PRINTLN("Incomplete OSC packet ignored.");
+      return;
+    }
+    message.fill(static_cast<uint8_t>(incoming_byte));
+  }
+
+  if (message.hasError()) {
+    DEBUG_PRINT("Invalid OSC message ignored. Error: ");
+    DEBUG_PRINTLN(static_cast<int>(message.getError()));
+    return;
+  }
+
+  processOSCMessage(message);
 }
 
 // HOMING FUNCTIONS
@@ -1782,5 +1869,6 @@ void loop() {
     updateAutoMode();
     updateJog();
   }
+  readOSC();
   readBTSerial();
 }

@@ -427,6 +427,18 @@ void processData(String data) {
     return;
   }
 
+  if (data.equalsIgnoreCase("RESTART")) {
+    stopJog();
+    stopAutoMode();
+    digitalWrite(MOTOR_1_PUL, LOW);
+    digitalWrite(MOTOR_2_PUL, LOW);
+    SerialBT.println("OK: Restarting ESP32");
+    SerialBT.flush();
+    delay(250);
+    ESP.restart();
+    return;
+  }
+
   if (data.equalsIgnoreCase("HOME")) {
     startHoming();
     SerialBT.println("OK: Homing triggered");
@@ -435,7 +447,8 @@ void processData(String data) {
 
   const int first_separator = data.indexOf(' ');
   if (first_separator < 0) {
-    SerialBT.println("ERROR: Use SET, JOG, GOTO, SAVE, HOME, or GET CONFIG");
+    SerialBT.println(
+        "ERROR: Use SET, JOG, GOTO, SAVE, HOME, RESTART, or GET CONFIG");
     return;
   }
 
@@ -460,7 +473,8 @@ void processData(String data) {
   }
 
   if (!command.equalsIgnoreCase("SET")) {
-    SerialBT.println("ERROR: Unknown command. Use SET, JOG, GOTO, SAVE, HOME, or GET CONFIG");
+    SerialBT.println(
+        "ERROR: Unknown command. Use SET, JOG, GOTO, SAVE, HOME, RESTART, or GET CONFIG");
     return;
   }
 

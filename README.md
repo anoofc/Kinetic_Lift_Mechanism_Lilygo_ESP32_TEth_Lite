@@ -136,6 +136,16 @@ This immediately stops any Jog or Automatic movement and starts the same
 non-blocking homing sequence used at power-up. After homing completes, the lift
 moves to P1 before the currently selected working mode is allowed to resume.
 
+### Restart the ESP32
+
+```text
+RESTART
+```
+
+This stops active motor pulse generation, acknowledges the command over
+Bluetooth, and performs a full ESP32 software restart. The normal power-up
+sequence then reloads NVS settings, initializes Ethernet, and starts homing.
+
 ### Move manually to a saved position
 
 The following commands are available in working modes `0` and `3`:

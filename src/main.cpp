@@ -184,8 +184,13 @@ bool startJog(bool jog_motor_1, bool jog_motor_2,
               JogDirection direction, uint32_t steps);
 void processJogCommand(String arguments);
 void processSavePositionCommand(String arguments);
+void processGotoCommand(String arguments);
 void stopAutoMode();
 void resetAutoMode();
+bool autoMoveIsActive();
+bool startSavedPositionMove(bool target_is_p1);
+void startAutoMove(int32_t motor_1_target, int32_t motor_2_target,
+                   bool target_is_p1);
 void startHoming();
 
 
@@ -343,7 +348,7 @@ void processData(String data) {
 
   const int first_separator = data.indexOf(' ');
   if (first_separator < 0) {
-    SerialBT.println("ERROR: Use SET, JOG, SAVE, HOME, or GET CONFIG");
+    SerialBT.println("ERROR: Use SET, JOG, GOTO, SAVE, HOME, or GET CONFIG");
     return;
   }
 
@@ -362,8 +367,13 @@ void processData(String data) {
     return;
   }
 
+  if (command.equalsIgnoreCase("GOTO") || command.equalsIgnoreCase("GO")) {
+    processGotoCommand(arguments);
+    return;
+  }
+
   if (!command.equalsIgnoreCase("SET")) {
-    SerialBT.println("ERROR: Unknown command. Use SET, JOG, SAVE, or GET CONFIG");
+    SerialBT.println("ERROR: Unknown command. Use SET, JOG, GOTO, SAVE, HOME, or GET CONFIG");
     return;
   }
 
@@ -547,6 +557,10 @@ void processData(String data) {
     working_mode = new_working_mode;
     if (working_mode == AUTO_WORKING_MODE) {
       resetAutoMode();
+    } else if (working_mode == 0 &&
+               homing_state == HomingState::COMPLETE &&
+               !startSavedPositionMove(true)) {
+      SerialBT.println("MODE_0_WAITING: A valid P1 position is required");
     }
     SerialBT.println("OK: WORKING_MODE=" + String(working_mode));
     return;
@@ -797,6 +811,11 @@ void processJogCommand(String arguments) {
     return;
   }
 
+  if (autoMoveIsActive()) {
+    SerialBT.println("ERROR: Wait for the P1/P2 positioning move to finish");
+    return;
+  }
+
   const String target = takeFirstToken(arguments);
   const String direction_text = takeFirstToken(arguments);
   bool jog_motor_1 = false;
@@ -975,11 +994,21 @@ void updateJog() {
 
 // AUTOMATIC P1/P2 LOOP FUNCTIONS
 
-bool autoPositionsAreValid() {
-  return p1_saved && p2_saved && motor_1_p1 >= 0 && motor_2_p1 >= 0 &&
-         motor_1_p2 > motor_1_p1 && motor_2_p2 > motor_2_p1 &&
+bool p1PositionIsValid() {
+  return p1_saved && motor_1_p1 >= 0 && motor_2_p1 >= 0 &&
+         motor_1_p1 <= static_cast<int32_t>(MAX_TRAVEL_STEPS) &&
+         motor_2_p1 <= static_cast<int32_t>(MAX_TRAVEL_STEPS);
+}
+
+bool p2PositionIsValid() {
+  return p2_saved && motor_1_p2 >= 0 && motor_2_p2 >= 0 &&
          motor_1_p2 <= static_cast<int32_t>(MAX_TRAVEL_STEPS) &&
          motor_2_p2 <= static_cast<int32_t>(MAX_TRAVEL_STEPS);
+}
+
+bool autoPositionsAreValid() {
+  return p1PositionIsValid() && p2PositionIsValid() &&
+         motor_1_p2 > motor_1_p1 && motor_2_p2 > motor_2_p1;
 }
 
 bool autoMoveIsActive() {
@@ -1004,6 +1033,47 @@ void stopAutoMode() {
 void resetAutoMode() {
   stopAutoMode();
   auto_state = AutoState::IDLE;
+}
+
+bool startSavedPositionMove(bool target_is_p1) {
+  if (homing_state != HomingState::COMPLETE ||
+      (target_is_p1 ? !p1PositionIsValid() : !p2PositionIsValid())) {
+    return false;
+  }
+
+  stopJog();
+  stopAutoMode();
+  startAutoMove(target_is_p1 ? motor_1_p1 : motor_1_p2,
+                target_is_p1 ? motor_2_p1 : motor_2_p2,
+                target_is_p1);
+  return true;
+}
+
+void processGotoCommand(String arguments) {
+  arguments.trim();
+
+  if (working_mode != 0 && working_mode != JOG_WORKING_MODE) {
+    SerialBT.println("ERROR: GOTO is available only in working modes 0 and 3");
+    return;
+  }
+  if (homing_state != HomingState::COMPLETE) {
+    SerialBT.println("ERROR: GOTO is unavailable until homing completes");
+    return;
+  }
+
+  const bool target_is_p1 = arguments.equalsIgnoreCase("P1");
+  const bool target_is_p2 = arguments.equalsIgnoreCase("P2");
+  if (!target_is_p1 && !target_is_p2) {
+    SerialBT.println("ERROR: Use GOTO P1 or GOTO P2");
+    return;
+  }
+
+  if (!startSavedPositionMove(target_is_p1)) {
+    SerialBT.println("ERROR: Requested position has not been calibrated");
+    return;
+  }
+
+  SerialBT.println("OK: Moving to " + String(target_is_p1 ? "P1" : "P2"));
 }
 
 void setAutoFault(const char *message) {
@@ -1185,14 +1255,18 @@ void updateAutoMove() {
 }
 
 void updateAutoMode() {
-  if (working_mode != AUTO_WORKING_MODE) {
-    if (auto_state != AutoState::IDLE) {
-      stopAutoMode();
-    }
+  if (homing_state != HomingState::COMPLETE || auto_state == AutoState::FAULT) {
     return;
   }
 
-  if (homing_state != HomingState::COMPLETE || auto_state == AutoState::FAULT) {
+  // A coordinated one-shot GOTO/P1-after-home move runs in modes 0, 1, or 3.
+  if (auto_state == AutoState::MOVING_TO_P1 ||
+      auto_state == AutoState::MOVING_TO_P2) {
+    updateAutoMove();
+    return;
+  }
+
+  if (working_mode != AUTO_WORKING_MODE) {
     return;
   }
 
@@ -1213,20 +1287,24 @@ void updateAutoMode() {
     return;
   }
 
-  if (auto_state == AutoState::MOVING_TO_P1 ||
-      auto_state == AutoState::MOVING_TO_P2) {
-    updateAutoMove();
-    return;
-  }
-
   if (auto_state == AutoState::WAITING_AT_P1 &&
       millis() - auto_position_reached_ms >= p1_delay_ms) {
+    if (!autoPositionsAreValid()) {
+      auto_state = AutoState::WAITING_FOR_POSITIONS;
+      SerialBT.println("AUTO_WAITING: Valid P1 and P2 positions are required");
+      return;
+    }
     startAutoMove(motor_1_p2, motor_2_p2, false);
     return;
   }
 
   if (auto_state == AutoState::WAITING_AT_P2 &&
       millis() - auto_position_reached_ms >= p2_delay_ms) {
+    if (!autoPositionsAreValid()) {
+      auto_state = AutoState::WAITING_FOR_POSITIONS;
+      SerialBT.println("AUTO_WAITING: Valid P1 and P2 positions are required");
+      return;
+    }
     startAutoMove(motor_1_p1, motor_2_p1, true);
   }
 }
@@ -1251,6 +1329,10 @@ void finishHoming() {
   homing_pulse_high = false;
   homing_state = HomingState::COMPLETE;
   DEBUG_PRINTLN("Homing complete. Both motor positions set to zero.");
+
+  if (!startSavedPositionMove(true)) {
+    SerialBT.println("P1_WAITING: A valid P1 position is required after homing");
+  }
 }
 
 void startHoming() {

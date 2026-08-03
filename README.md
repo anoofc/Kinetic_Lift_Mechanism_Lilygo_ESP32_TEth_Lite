@@ -68,18 +68,20 @@ On every power-up, the firmware:
 3. Starts Bluetooth Classic Serial using `KINETIC_LIFT_<DEVICE_ID>`.
 4. Starts non-blocking homing for both motors.
 5. Sets both live motor-position counters to zero after both switches are reached.
-6. Starts the selected working mode after homing completes.
+6. Immediately performs a coordinated move to the saved P1 coordinates.
+7. Starts the selected working mode after reaching P1.
 
 Both motors receive synchronized step edges during homing. When one motor reaches
 its own switch, that motor stops while the other continues until its switch is
 reached. A 30-second homing timeout stops both motors and reports a critical
-fault.
+fault. If P1 has not been calibrated, the mechanism remains at home and reports
+that a valid P1 position is required.
 
 ## Working modes
 
 | Value | Mode | Current behavior |
 | ---: | --- | --- |
-| 0 | Home | Startup homing; no subsequent movement scenario |
+| 0 | Standby/P1 | Moves to P1 when enabled and accepts manual `GOTO` commands |
 | 1 | Manual | Reserved for a later Bluetooth manual-control scenario |
 | 2 | Automatic | Continuously moves P1 → P2 → P1 with independent endpoint delays |
 | 3 | Jog | Bluetooth synchronized or individual finite-step adjustment |
@@ -110,8 +112,26 @@ HOME
 ```
 
 This immediately stops any Jog or Automatic movement and starts the same
-non-blocking homing sequence used at power-up. After homing completes, the
-currently selected working mode is allowed to resume.
+non-blocking homing sequence used at power-up. After homing completes, the lift
+moves to P1 before the currently selected working mode is allowed to resume.
+
+### Move manually to a saved position
+
+The following commands are available in working modes `0` and `3`:
+
+```text
+GOTO P1
+GOTO P2
+```
+
+`GO P1` and `GO P2` are accepted as aliases. These commands use the same
+coordinated acceleration/deceleration trajectory as Automatic mode. Both motors
+move to their individually calibrated coordinates and arrive together. Entering
+working mode `0` also triggers a move to P1:
+
+```text
+SET WORKING_MODE 0
+```
 
 ### Persistent configuration commands
 

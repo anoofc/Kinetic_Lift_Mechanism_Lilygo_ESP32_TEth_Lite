@@ -36,6 +36,7 @@ constexpr char NVS_NAMESPACE[] = "kinetic_lift";
 constexpr char NVS_DEVICE_ID_KEY[] = "device_id";
 constexpr char NVS_HOMING_SPEED_KEY[] = "home_speed";
 constexpr char NVS_WORKING_MODE_KEY[] = "work_mode";
+constexpr char NVS_JOG_SPEED_KEY[] = "jog_speed";
 constexpr char NVS_MOTOR_1_P1_KEY[] = "m1_p1";
 constexpr char NVS_MOTOR_2_P1_KEY[] = "m2_p1";
 constexpr char NVS_MOTOR_1_P2_KEY[] = "m1_p2";
@@ -53,6 +54,7 @@ constexpr uint8_t DEFAULT_DEVICE_ID = 1;
 constexpr uint32_t DEFAULT_HOMING_SPEED = 1000;
 constexpr uint8_t DEFAULT_WORKING_MODE = 0;
 constexpr uint32_t DEFAULT_MOVE_SPEED = 1000;
+constexpr uint32_t DEFAULT_JOG_SPEED = 6400;
 constexpr uint32_t DEFAULT_ACCELERATION = 1000;
 constexpr uint32_t DEFAULT_DECELERATION = 1000;
 constexpr uint32_t DEFAULT_P1_DELAY_MS = 1000;
@@ -64,7 +66,8 @@ constexpr uint32_t TRAVEL_LENGTH_MM = 400;
 constexpr uint32_t STEPS_PER_MM =
     STEPS_PER_REVOLUTION / LEAD_SCREW_LEAD_MM;
 constexpr uint32_t MAX_TRAVEL_STEPS = STEPS_PER_MM * TRAVEL_LENGTH_MM;
-constexpr uint32_t MAX_MOTOR_RPM = 300;
+constexpr uint32_t MAX_MOVE_MOTOR_RPM = 450;
+constexpr uint32_t MAX_JOG_MOTOR_RPM = 300;
 constexpr uint32_t MAX_LINEAR_ACCELERATION_MM_S2 = 100;
 
 constexpr uint8_t MIN_DEVICE_ID = 1;
@@ -77,7 +80,10 @@ constexpr uint8_t AUTO_WORKING_MODE = 2;
 constexpr uint8_t JOG_WORKING_MODE = 3;
 constexpr uint32_t MIN_MOVE_SPEED = 1;
 constexpr uint32_t MAX_MOVE_SPEED =
-    STEPS_PER_REVOLUTION * MAX_MOTOR_RPM / 60;
+    STEPS_PER_REVOLUTION * MAX_MOVE_MOTOR_RPM / 60;
+constexpr uint32_t MIN_JOG_SPEED = 1;
+constexpr uint32_t MAX_JOG_SPEED =
+    STEPS_PER_REVOLUTION * MAX_JOG_MOTOR_RPM / 60;
 constexpr uint32_t MIN_ACCELERATION = 1;
 constexpr uint32_t MAX_ACCELERATION =
     STEPS_PER_MM * MAX_LINEAR_ACCELERATION_MM_S2;
@@ -90,6 +96,7 @@ uint8_t device_id = DEFAULT_DEVICE_ID;
 uint32_t motor_homing_speed = DEFAULT_HOMING_SPEED; // Steps per second.
 uint8_t working_mode = DEFAULT_WORKING_MODE;
 uint32_t move_speed = DEFAULT_MOVE_SPEED; // Master steps per second.
+uint32_t jog_speed = DEFAULT_JOG_SPEED; // Steps per second.
 uint32_t acceleration = DEFAULT_ACCELERATION; // Master steps per second squared.
 uint32_t deceleration = DEFAULT_DECELERATION; // Master steps per second squared.
 uint32_t p1_delay_ms = DEFAULT_P1_DELAY_MS;
@@ -109,7 +116,6 @@ bool p2_saved = false;
 
 constexpr uint32_t STEP_PULSE_WIDTH_US = 10;
 constexpr uint32_t HOMING_TIMEOUT_MS = 30000;
-constexpr uint32_t JOG_SPEED = 250; // Steps per second.
 constexpr uint32_t DEFAULT_JOG_STEPS = 10;
 constexpr uint32_t MAX_JOG_STEPS = MAX_TRAVEL_STEPS;
 constexpr float MIN_PROFILE_SPEED = 10.0F;
@@ -190,6 +196,7 @@ void sendConfiguration() {
   SerialBT.println("HOMING_SPEED=" + String(motor_homing_speed) + " steps/s");
   SerialBT.println("WORKING_MODE=" + String(working_mode));
   SerialBT.println("MOVE_SPEED=" + String(move_speed) + " steps/s");
+  SerialBT.println("JOG_SPEED=" + String(jog_speed) + " steps/s");
   SerialBT.println("ACCELERATION=" + String(acceleration) + " steps/s^2");
   SerialBT.println("DECELERATION=" + String(deceleration) + " steps/s^2");
   SerialBT.println("P1_DELAY=" + String(p1_delay_ms) + " ms");
@@ -245,6 +252,11 @@ bool saveWorkingMode(uint8_t value) {
 bool saveMoveSpeed(uint32_t value) {
   return preferences_ready &&
          pref.putUInt(NVS_MOVE_SPEED_KEY, value) == sizeof(value);
+}
+
+bool saveJogSpeed(uint32_t value) {
+  return preferences_ready &&
+         pref.putUInt(NVS_JOG_SPEED_KEY, value) == sizeof(value);
 }
 
 bool saveAcceleration(uint32_t value) {
@@ -425,6 +437,21 @@ void processData(String data) {
     return;
   }
 
+  if (parameter.equalsIgnoreCase("JOG_SPEED")) {
+    if (value < MIN_JOG_SPEED || value > MAX_JOG_SPEED) {
+      SerialBT.println("ERROR: JOG_SPEED range is 1-" +
+                       String(MAX_JOG_SPEED) + " steps/s");
+      return;
+    }
+    if (value != jog_speed && !saveJogSpeed(value)) {
+      SerialBT.println("ERROR: Failed to save JOG_SPEED to NVS");
+      return;
+    }
+    jog_speed = value;
+    SerialBT.println("OK: JOG_SPEED=" + String(jog_speed) + " steps/s");
+    return;
+  }
+
   if (parameter.equalsIgnoreCase("ACCELERATION")) {
     if (value < MIN_ACCELERATION || value > MAX_ACCELERATION) {
       SerialBT.println("ERROR: ACCELERATION range is 1-" +
@@ -556,6 +583,7 @@ void initializeParameters() {
       pref.getUInt(NVS_HOMING_SPEED_KEY, DEFAULT_HOMING_SPEED);
   working_mode = pref.getUChar(NVS_WORKING_MODE_KEY, DEFAULT_WORKING_MODE);
   move_speed = pref.getUInt(NVS_MOVE_SPEED_KEY, DEFAULT_MOVE_SPEED);
+  jog_speed = pref.getUInt(NVS_JOG_SPEED_KEY, DEFAULT_JOG_SPEED);
   acceleration = pref.getUInt(NVS_ACCELERATION_KEY, DEFAULT_ACCELERATION);
   deceleration = pref.getUInt(NVS_DECELERATION_KEY, DEFAULT_DECELERATION);
   const uint32_t legacy_position_delay = pref.getUInt(
@@ -595,6 +623,13 @@ void initializeParameters() {
     move_speed = DEFAULT_MOVE_SPEED;
     if (!saveMoveSpeed(move_speed)) {
       Serial.println("CRITICAL: Failed to repair MOVE_SPEED in NVS.");
+    }
+  }
+
+  if (jog_speed < MIN_JOG_SPEED || jog_speed > MAX_JOG_SPEED) {
+    jog_speed = DEFAULT_JOG_SPEED;
+    if (!saveJogSpeed(jog_speed)) {
+      Serial.println("CRITICAL: Failed to repair JOG_SPEED in NVS.");
     }
   }
 
@@ -904,7 +939,7 @@ void updateJog() {
     return;
   }
 
-  const uint32_t jog_step_interval_us = 1000000UL / JOG_SPEED;
+  const uint32_t jog_step_interval_us = 1000000UL / jog_speed;
   if (now_us - last_jog_step_us < jog_step_interval_us) {
     return;
   }

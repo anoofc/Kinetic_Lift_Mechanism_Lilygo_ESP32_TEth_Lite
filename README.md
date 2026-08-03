@@ -46,17 +46,18 @@ lead screw with 4 mm travel per revolution:
 1600 steps/mm × 400 mm travel = 640000 steps maximum travel
 ```
 
-The firmware uses a conservative configurable ceiling of 300 motor RPM:
+Automatic mode has a configurable movement ceiling of 450 motor RPM:
 
 ```text
-6400 steps/revolution × 300 RPM ÷ 60 = 32000 steps/s
-32000 steps/s ÷ 1600 steps/mm = 20 mm/s
+6400 steps/revolution × 450 RPM ÷ 60 = 48000 steps/s
+48000 steps/s ÷ 1600 steps/mm = 30 mm/s
 ```
 
 Maximum configurable acceleration and deceleration are 160000 steps/s², equal
 to 100 mm/s². These are software ceilings, not guaranteed safe operating values.
 The motor, driver, supply voltage, load, and structure may require substantially
-lower settings.
+lower settings. Jog mode remains capped at 32000 steps/s (300 RPM or 20 mm/s)
+because it starts without an acceleration profile.
 
 ## Startup sequence
 
@@ -119,7 +120,8 @@ currently selected working mode is allowed to resume.
 | `SET DEVICE_ID <value>` | 1–255 | — | 1 | Bluetooth name changes after restart |
 | `SET HOMING_SPEED <value>` | 1–5000 | steps/s | 1000 | Homing speed |
 | `SET WORKING_MODE <value>` | 0–3 | — | 0 | Selects the working mode |
-| `SET MOVE_SPEED <value>` | 1–32000 | master steps/s | 1000 | Maximum automatic-mode speed |
+| `SET MOVE_SPEED <value>` | 1–48000 | master steps/s | 1000 | Maximum automatic-mode speed |
+| `SET JOG_SPEED <value>` | 1–32000 | steps/s | 6400 | Constant Jog-mode speed |
 | `SET ACCELERATION <value>` | 1–160000 | steps/s² | 1000 | Automatic acceleration |
 | `SET DECELERATION <value>` | 1–160000 | steps/s² | 1000 | Automatic deceleration |
 | `SET P1_DELAY <value>` | 0–600000 | ms | 1000 | Dwell after reaching P1 |
@@ -142,6 +144,7 @@ selected:
 
 ```text
 SET WORKING_MODE 3
+SET JOG_SPEED 6400
 ```
 
 ### Jog both motors together
@@ -170,11 +173,14 @@ JOG BOTH AWAY 100
 JOG M1 HOME 2
 ```
 
-Jogging runs non-blocking at 250 steps/s. Each command is a bounded movement,
-which prevents a lost Bluetooth button-release message from leaving a motor
-running continuously. AWAY jogging is also clamped to the calculated 640000-step
-travel range. A synchronized `BOTH` jog uses the same safe step count for both
-motors. A new jog command replaces any unfinished jog movement.
+Jogging runs non-blocking at the saved `JOG_SPEED`. Its default is 6400 steps/s,
+equal to 4 mm/s, and it is configurable up to 32000 steps/s (20 mm/s). Jogging
+uses constant speed without the Automatic mode acceleration profile, so increase
+this value carefully. Each command is a bounded movement, which prevents a lost
+Bluetooth button-release message from leaving a motor running continuously.
+AWAY jogging is also clamped to the calculated 640000-step travel range. A
+synchronized `BOTH` jog uses the same safe step count for both motors. A new jog
+command replaces any unfinished jog movement.
 Use the following command when an immediate stop is required:
 
 ```text

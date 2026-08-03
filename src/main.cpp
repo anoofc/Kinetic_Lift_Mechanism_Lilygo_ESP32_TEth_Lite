@@ -57,6 +57,16 @@ constexpr uint32_t DEFAULT_ACCELERATION = 1000;
 constexpr uint32_t DEFAULT_DECELERATION = 1000;
 constexpr uint32_t DEFAULT_P1_DELAY_MS = 1000;
 constexpr uint32_t DEFAULT_P2_DELAY_MS = 1000;
+
+constexpr uint32_t STEPS_PER_REVOLUTION = 6400;
+constexpr uint32_t LEAD_SCREW_LEAD_MM = 4;
+constexpr uint32_t TRAVEL_LENGTH_MM = 400;
+constexpr uint32_t STEPS_PER_MM =
+    STEPS_PER_REVOLUTION / LEAD_SCREW_LEAD_MM;
+constexpr uint32_t MAX_TRAVEL_STEPS = STEPS_PER_MM * TRAVEL_LENGTH_MM;
+constexpr uint32_t MAX_MOTOR_RPM = 300;
+constexpr uint32_t MAX_LINEAR_ACCELERATION_MM_S2 = 100;
+
 constexpr uint8_t MIN_DEVICE_ID = 1;
 constexpr uint8_t MAX_DEVICE_ID = 255;
 constexpr uint32_t MIN_HOMING_SPEED = 1;
@@ -66,11 +76,14 @@ constexpr uint8_t MAX_WORKING_MODE = 3;
 constexpr uint8_t AUTO_WORKING_MODE = 2;
 constexpr uint8_t JOG_WORKING_MODE = 3;
 constexpr uint32_t MIN_MOVE_SPEED = 1;
-constexpr uint32_t MAX_MOVE_SPEED = 5000;
+constexpr uint32_t MAX_MOVE_SPEED =
+    STEPS_PER_REVOLUTION * MAX_MOTOR_RPM / 60;
 constexpr uint32_t MIN_ACCELERATION = 1;
-constexpr uint32_t MAX_ACCELERATION = 50000;
+constexpr uint32_t MAX_ACCELERATION =
+    STEPS_PER_MM * MAX_LINEAR_ACCELERATION_MM_S2;
 constexpr uint32_t MIN_DECELERATION = 1;
-constexpr uint32_t MAX_DECELERATION = 50000;
+constexpr uint32_t MAX_DECELERATION =
+    STEPS_PER_MM * MAX_LINEAR_ACCELERATION_MM_S2;
 constexpr uint32_t MAX_ENDPOINT_DELAY_MS = 600000;
 
 uint8_t device_id = DEFAULT_DEVICE_ID;
@@ -98,10 +111,8 @@ constexpr uint32_t STEP_PULSE_WIDTH_US = 10;
 constexpr uint32_t HOMING_TIMEOUT_MS = 30000;
 constexpr uint32_t JOG_SPEED = 250; // Steps per second.
 constexpr uint32_t DEFAULT_JOG_STEPS = 10;
-constexpr uint32_t MAX_JOG_STEPS = 10000;
+constexpr uint32_t MAX_JOG_STEPS = MAX_TRAVEL_STEPS;
 constexpr float MIN_PROFILE_SPEED = 10.0F;
-constexpr uint8_t BT_MAX_BYTES_PER_LOOP = 64;
-constexpr size_t BT_MAX_COMMAND_LENGTH = 128;
 
 enum class HomingState : uint8_t {
   IDLE,
@@ -169,6 +180,7 @@ void processJogCommand(String arguments);
 void processSavePositionCommand(String arguments);
 void stopAutoMode();
 void resetAutoMode();
+void startHoming();
 
 
 // BLUETOOTH SERIAL FUNCTIONS
@@ -311,9 +323,15 @@ void processData(String data) {
     return;
   }
 
+  if (data.equalsIgnoreCase("HOME")) {
+    startHoming();
+    SerialBT.println("OK: Homing triggered");
+    return;
+  }
+
   const int first_separator = data.indexOf(' ');
   if (first_separator < 0) {
-    SerialBT.println("ERROR: Use SET <PARAMETER> <VALUE> or GET CONFIG");
+    SerialBT.println("ERROR: Use SET, JOG, SAVE, HOME, or GET CONFIG");
     return;
   }
 
@@ -394,7 +412,8 @@ void processData(String data) {
 
   if (parameter.equalsIgnoreCase("MOVE_SPEED")) {
     if (value < MIN_MOVE_SPEED || value > MAX_MOVE_SPEED) {
-      SerialBT.println("ERROR: MOVE_SPEED range is 1-5000 steps/s");
+      SerialBT.println("ERROR: MOVE_SPEED range is 1-" +
+                       String(MAX_MOVE_SPEED) + " steps/s");
       return;
     }
     if (value != move_speed && !saveMoveSpeed(value)) {
@@ -408,7 +427,8 @@ void processData(String data) {
 
   if (parameter.equalsIgnoreCase("ACCELERATION")) {
     if (value < MIN_ACCELERATION || value > MAX_ACCELERATION) {
-      SerialBT.println("ERROR: ACCELERATION range is 1-50000 steps/s^2");
+      SerialBT.println("ERROR: ACCELERATION range is 1-" +
+                       String(MAX_ACCELERATION) + " steps/s^2");
       return;
     }
     if (value != acceleration && !saveAcceleration(value)) {
@@ -423,7 +443,8 @@ void processData(String data) {
 
   if (parameter.equalsIgnoreCase("DECELERATION")) {
     if (value < MIN_DECELERATION || value > MAX_DECELERATION) {
-      SerialBT.println("ERROR: DECELERATION range is 1-50000 steps/s^2");
+      SerialBT.println("ERROR: DECELERATION range is 1-" +
+                       String(MAX_DECELERATION) + " steps/s^2");
       return;
     }
     if (value != deceleration && !saveDeceleration(value)) {
@@ -508,33 +529,14 @@ void processData(String data) {
 }
 
 void readBTSerial() {
-  static String incoming;
-  static bool discard_until_newline = false;
-  uint8_t bytes_read = 0;
+  if (SerialBT.available() > 0) {
+    String incoming = SerialBT.readStringUntil('\n');
+    incoming.trim();
 
-  while (SerialBT.available() > 0 && bytes_read < BT_MAX_BYTES_PER_LOOP) {
-    const char received = static_cast<char>(SerialBT.read());
-    ++bytes_read;
-
-    if (received == '\n') {
-      if (!discard_until_newline) {
-        incoming.trim();
-      }
-      if (!discard_until_newline && !incoming.isEmpty()) {
-        DEBUG_PRINT("BT Serial received: ");
-        DEBUG_PRINTLN(incoming);
-        processData(incoming);
-      }
-      incoming = "";
-      discard_until_newline = false;
-    } else if (!discard_until_newline && received != '\r' &&
-               incoming.length() < BT_MAX_COMMAND_LENGTH) {
-      incoming += received;
-    } else if (!discard_until_newline && received != '\r') {
-      incoming = "";
-      discard_until_newline = true;
-      DEBUG_PRINTLN("BT Serial command discarded: command is too long.");
-      SerialBT.println("ERROR: Command is too long");
+    if (!incoming.isEmpty()) {
+      DEBUG_PRINT("BT Serial received: ");
+      DEBUG_PRINTLN(incoming);
+      processData(incoming);
     }
   }
 }
@@ -677,15 +679,47 @@ bool startJog(bool jog_motor_1, bool jog_motor_2,
   stopJog();
   jog_direction = direction;
 
+  uint32_t motor_1_permitted_steps = steps;
+  uint32_t motor_2_permitted_steps = steps;
+  if (direction == JogDirection::AWAY) {
+    const uint32_t motor_1_available_steps =
+        motor_1_position <= 0
+            ? MAX_TRAVEL_STEPS
+            : (motor_1_position >= static_cast<int32_t>(MAX_TRAVEL_STEPS)
+                   ? 0
+                   : MAX_TRAVEL_STEPS -
+                         static_cast<uint32_t>(motor_1_position));
+    const uint32_t motor_2_available_steps =
+        motor_2_position <= 0
+            ? MAX_TRAVEL_STEPS
+            : (motor_2_position >= static_cast<int32_t>(MAX_TRAVEL_STEPS)
+                   ? 0
+                   : MAX_TRAVEL_STEPS -
+                         static_cast<uint32_t>(motor_2_position));
+    motor_1_permitted_steps = min(steps, motor_1_available_steps);
+    motor_2_permitted_steps = min(steps, motor_2_available_steps);
+
+    // A BOTH jog uses the same bounded step count to preserve alignment.
+    if (jog_motor_1 && jog_motor_2) {
+      const uint32_t common_steps =
+          min(motor_1_permitted_steps, motor_2_permitted_steps);
+      motor_1_permitted_steps = common_steps;
+      motor_2_permitted_steps = common_steps;
+    }
+  }
+
   if (jog_motor_1) {
     digitalWrite(MOTOR_1_DIR,
                  direction == JogDirection::HOME
                      ? MOTOR_1_HOMING_DIRECTION
                      : !MOTOR_1_HOMING_DIRECTION);
-    motor_1_jogging =
-        direction != JogDirection::HOME || !isMotor1LimitTriggered();
-    motor_1_jog_steps_remaining = motor_1_jogging ? steps : 0;
-    if (!motor_1_jogging) {
+    motor_1_jogging = motor_1_permitted_steps > 0 &&
+                      (direction != JogDirection::HOME ||
+                       !isMotor1LimitTriggered());
+    motor_1_jog_steps_remaining =
+        motor_1_jogging ? motor_1_permitted_steps : 0;
+    if (!motor_1_jogging && direction == JogDirection::HOME &&
+        isMotor1LimitTriggered()) {
       motor_1_position = 0;
     }
   }
@@ -695,10 +729,13 @@ bool startJog(bool jog_motor_1, bool jog_motor_2,
                  direction == JogDirection::HOME
                      ? MOTOR_2_HOMING_DIRECTION
                      : !MOTOR_2_HOMING_DIRECTION);
-    motor_2_jogging =
-        direction != JogDirection::HOME || !isMotor2LimitTriggered();
-    motor_2_jog_steps_remaining = motor_2_jogging ? steps : 0;
-    if (!motor_2_jogging) {
+    motor_2_jogging = motor_2_permitted_steps > 0 &&
+                      (direction != JogDirection::HOME ||
+                       !isMotor2LimitTriggered());
+    motor_2_jog_steps_remaining =
+        motor_2_jogging ? motor_2_permitted_steps : 0;
+    if (!motor_2_jogging && direction == JogDirection::HOME &&
+        isMotor2LimitTriggered()) {
       motor_2_position = 0;
     }
   }
@@ -760,12 +797,13 @@ void processJogCommand(String arguments) {
     return;
   }
   if (steps == 0 || steps > MAX_JOG_STEPS) {
-    SerialBT.println("ERROR: Jog steps range is 1-10000");
+    SerialBT.println("ERROR: Jog steps range is 1-" +
+                     String(MAX_JOG_STEPS));
     return;
   }
 
   if (!startJog(jog_motor_1, jog_motor_2, direction, steps)) {
-    SerialBT.println("ERROR: Selected motor is already at its home limit");
+    SerialBT.println("ERROR: Selected motor cannot move farther in that direction");
     return;
   }
 
@@ -904,7 +942,9 @@ void updateJog() {
 
 bool autoPositionsAreValid() {
   return p1_saved && p2_saved && motor_1_p1 >= 0 && motor_2_p1 >= 0 &&
-         motor_1_p2 > motor_1_p1 && motor_2_p2 > motor_2_p1;
+         motor_1_p2 > motor_1_p1 && motor_2_p2 > motor_2_p1 &&
+         motor_1_p2 <= static_cast<int32_t>(MAX_TRAVEL_STEPS) &&
+         motor_2_p2 <= static_cast<int32_t>(MAX_TRAVEL_STEPS);
 }
 
 bool autoMoveIsActive() {

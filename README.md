@@ -5,8 +5,9 @@ motors support synchronized homing, Bluetooth calibration/jogging, and automatic
 movement between two saved endpoints.
 
 The mechanism is treated as one shared load supported by a motor at each end.
-Motion is implemented as non-blocking state machines so limit switches,
-Bluetooth commands, and motor pulses continue to be serviced from `loop()`.
+Motor motion is implemented as non-blocking state machines. Bluetooth command
+input uses `readStringUntil('\n')`, so an incomplete command can wait for the
+Serial timeout before motor state-machine processing resumes.
 
 ## Hardware configuration
 
@@ -34,6 +35,28 @@ The configured homing direction is LOW for both motor direction outputs:
 
 Verify both motor directions and limit-switch polarities with the mechanism
 unloaded before normal operation.
+
+### Mechanical conversion and limits
+
+The configured mechanism uses 6400 driver steps per motor revolution and a 1204
+lead screw with 4 mm travel per revolution:
+
+```text
+6400 steps/revolution ÷ 4 mm/revolution = 1600 steps/mm
+1600 steps/mm × 400 mm travel = 640000 steps maximum travel
+```
+
+The firmware uses a conservative configurable ceiling of 300 motor RPM:
+
+```text
+6400 steps/revolution × 300 RPM ÷ 60 = 32000 steps/s
+32000 steps/s ÷ 1600 steps/mm = 20 mm/s
+```
+
+Maximum configurable acceleration and deceleration are 160000 steps/s², equal
+to 100 mm/s². These are software ceilings, not guaranteed safe operating values.
+The motor, driver, supply voltage, load, and structure may require substantially
+lower settings.
 
 ## Startup sequence
 
@@ -68,6 +91,7 @@ the saved mode is allowed to move the motors.
 Commands are case-insensitive and must end with a newline (`\n`). Bluetooth
 replies with `OK`, `ERROR`, movement status, or the requested configuration.
 Incoming commands are also printed to USB Serial when `DEBUG` is enabled.
+Send Bluetooth configuration commands while the mechanism is stationary.
 
 ### Read the current configuration
 
@@ -78,6 +102,16 @@ GET CONFIG
 The response includes all motion parameters, current motor positions, and both
 motors' saved P1/P2 coordinates.
 
+### Trigger homing
+
+```text
+HOME
+```
+
+This immediately stops any Jog or Automatic movement and starts the same
+non-blocking homing sequence used at power-up. After homing completes, the
+currently selected working mode is allowed to resume.
+
 ### Persistent configuration commands
 
 | Command | Range | Unit | Default | Notes |
@@ -85,9 +119,9 @@ motors' saved P1/P2 coordinates.
 | `SET DEVICE_ID <value>` | 1–255 | — | 1 | Bluetooth name changes after restart |
 | `SET HOMING_SPEED <value>` | 1–5000 | steps/s | 1000 | Homing speed |
 | `SET WORKING_MODE <value>` | 0–3 | — | 0 | Selects the working mode |
-| `SET MOVE_SPEED <value>` | 1–5000 | master steps/s | 1000 | Maximum automatic-mode speed |
-| `SET ACCELERATION <value>` | 1–50000 | steps/s² | 1000 | Automatic acceleration |
-| `SET DECELERATION <value>` | 1–50000 | steps/s² | 1000 | Automatic deceleration |
+| `SET MOVE_SPEED <value>` | 1–32000 | master steps/s | 1000 | Maximum automatic-mode speed |
+| `SET ACCELERATION <value>` | 1–160000 | steps/s² | 1000 | Automatic acceleration |
+| `SET DECELERATION <value>` | 1–160000 | steps/s² | 1000 | Automatic deceleration |
 | `SET P1_DELAY <value>` | 0–600000 | ms | 1000 | Dwell after reaching P1 |
 | `SET P2_DELAY <value>` | 0–600000 | ms | 1000 | Dwell after reaching P2 |
 
@@ -129,7 +163,7 @@ JOG MOTOR2 HOME
 ```
 
 `M1` and `M2` are accepted as shorter target names. A jog command moves 10 steps
-by default. Supply a final value to select an increment from 1 to 10000 steps:
+by default. Supply a final value to select an increment from 1 to 640000 steps:
 
 ```text
 JOG BOTH AWAY 100
@@ -138,7 +172,9 @@ JOG M1 HOME 2
 
 Jogging runs non-blocking at 250 steps/s. Each command is a bounded movement,
 which prevents a lost Bluetooth button-release message from leaving a motor
-running continuously. A new jog command replaces any unfinished jog movement.
+running continuously. AWAY jogging is also clamped to the calculated 640000-step
+travel range. A synchronized `BOTH` jog uses the same safe step count for both
+motors. A new jog command replaces any unfinished jog movement.
 Use the following command when an immediate stop is required:
 
 ```text

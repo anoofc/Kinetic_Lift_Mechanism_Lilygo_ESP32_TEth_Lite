@@ -20,6 +20,18 @@ Serial timeout before motor state-machine processing resumes.
 | Motor 1 home limit | 34 | Input |
 | Motor 2 home limit | 35 | Input |
 
+Ethernet uses the tested RTL8201 configuration from `src/eth_properties.h`:
+
+| Ethernet signal | ESP32 GPIO / value |
+| --- | ---: |
+| PHY type | RTL8201 |
+| PHY address | 0 |
+| Reference clock | GPIO0 input |
+| MDC | 23 |
+| MDIO | 18 |
+| PHY power | 12 |
+| PHY reset | Not used (`-1`) |
+
 GPIO34 and GPIO35 are input-only pins and do not have internal pull resistors.
 The limit-switch circuits must therefore provide suitable external pull
 resistors. The current firmware expects both switches to be active LOW.
@@ -66,10 +78,12 @@ On every power-up, the firmware:
 1. Initializes all GPIO with the pulse and direction outputs LOW.
 2. Loads saved parameters and calibrated positions from ESP32 NVS.
 3. Starts Bluetooth Classic Serial using `KINETIC_LIFT_<DEVICE_ID>`.
-4. Starts non-blocking homing for both motors.
-5. Sets both live motor-position counters to zero after both switches are reached.
-6. Immediately performs a coordinated move to the saved P1 coordinates.
-7. Starts the selected working mode after reaching P1.
+4. Initializes Ethernet with the saved static network configuration and opens
+   the UDP input port.
+5. Starts non-blocking homing for both motors.
+6. Sets both live motor-position counters to zero after both switches are reached.
+7. Immediately performs a coordinated move to the saved P1 coordinates.
+8. Starts the selected working mode after reaching P1.
 
 Both motors receive synchronized step edges during homing. When one motor reaches
 its own switch, that motor stops while the other continues until its switch is
@@ -78,7 +92,7 @@ fault. If P1 has not been calibrated, the mechanism remains at home and reports
 that a valid P1 position is required.
 
 If either home-limit switch becomes newly active during Jog, GOTO, or Automatic
-movement, both motors stop immediately. The firmware waits 500 ms without
+movement, both motors stop immediately. The firmware waits 5 seconds without
 blocking and then starts synchronized homing. Switch activation is edge-detected,
 so a switch that is already held at home can be released normally when beginning
 an AWAY move. Jog, GOTO, and position-save commands are unavailable while this
@@ -89,7 +103,7 @@ delayed homing is pending.
 | Value | Mode | Current behavior |
 | ---: | --- | --- |
 | 0 | Standby/P1 | Moves to P1 when enabled and accepts manual `GOTO` commands |
-| 1 | Manual | Reserved for a later Bluetooth manual-control scenario |
+| 1 | OSC control | Reserved for the upcoming UDP OSC position commands |
 | 2 | Automatic | Continuously moves P1 → P2 → P1 with independent endpoint delays |
 | 3 | Jog | Bluetooth synchronized or individual finite-step adjustment |
 
@@ -109,8 +123,8 @@ Send Bluetooth configuration commands while the mechanism is stationary.
 GET CONFIG
 ```
 
-The response includes all motion parameters, current motor positions, and both
-motors' saved P1/P2 coordinates.
+The response includes all motion and Ethernet/UDP parameters, current motor
+positions, and both motors' saved P1/P2 coordinates.
 
 ### Trigger homing
 
@@ -153,6 +167,12 @@ SET WORKING_MODE 0
 | `SET DECELERATION <value>` | 1–160000 | steps/s² | 1000 | Automatic deceleration |
 | `SET P1_DELAY <value>` | 0–600000 | ms | 1000 | Dwell after reaching P1 |
 | `SET P2_DELAY <value>` | 0–600000 | ms | 1000 | Dwell after reaching P2 |
+| `SET DEVICE_IP <address>` | Valid IPv4 host | — | 192.168.1.100 | ESP32 static Ethernet IP |
+| `SET GATEWAY <address>` | Valid IPv4 host | — | 192.168.1.1 | Ethernet gateway |
+| `SET SUBNET <mask>` | Valid IPv4 mask | — | 255.255.255.0 | Ethernet subnet mask |
+| `SET UDP_IN_PORT <value>` | 1–65535 | — | 8000 | Local OSC receive port |
+| `SET UDP_OUT_IP <address>` | Valid IPv4 host | — | 192.168.1.101 | OSC destination IP |
+| `SET UDP_OUT_PORT <value>` | 1–65535 | — | 8001 | OSC destination port |
 
 For compatibility, the following command sets both endpoint delays to the same
 value:
@@ -163,6 +183,23 @@ SET POSITION_DELAY 3000
 
 All validated configuration values are stored in the NVS namespace
 `kinetic_lift` and survive power cycles.
+
+Network changes are saved immediately but take effect after restarting the
+device. For example:
+
+```text
+SET DEVICE_IP 192.168.10.50
+SET GATEWAY 192.168.10.1
+SET SUBNET 255.255.255.0
+SET UDP_IN_PORT 9000
+SET UDP_OUT_IP 192.168.10.20
+SET UDP_OUT_PORT 9001
+GET CONFIG
+```
+
+Ethernet startup does not wait for a physical link, so it does not delay the
+non-blocking homing sequence. OSC command parsing is added separately as part of
+working mode `1`; this stage only prepares Ethernet and the UDP socket.
 
 ## Jog mode and endpoint calibration
 

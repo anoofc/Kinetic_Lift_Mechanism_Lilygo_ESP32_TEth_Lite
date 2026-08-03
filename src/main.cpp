@@ -20,6 +20,10 @@
 
 #include <BluetoothSerial.h>
 #include <Preferences.h>
+#include <ETH.h>
+#include <WiFiUdp.h>
+#include <OSCMessage.h>
+#include "eth_properties.h"
 
 #if DEBUG
 #define DEBUG_PRINT(...) Serial.print(__VA_ARGS__)
@@ -31,6 +35,7 @@
 
 BluetoothSerial SerialBT;
 Preferences pref;
+WiFiUDP osc_udp;
 
 constexpr char NVS_NAMESPACE[] = "kinetic_lift";
 constexpr char NVS_DEVICE_ID_KEY[] = "device_id";
@@ -49,6 +54,12 @@ constexpr char NVS_DECELERATION_KEY[] = "deceleration";
 constexpr char NVS_LEGACY_POSITION_DELAY_KEY[] = "pos_delay";
 constexpr char NVS_P1_DELAY_KEY[] = "p1_delay";
 constexpr char NVS_P2_DELAY_KEY[] = "p2_delay";
+constexpr char NVS_DEVICE_IP_KEY[] = "device_ip";
+constexpr char NVS_GATEWAY_KEY[] = "gateway";
+constexpr char NVS_SUBNET_KEY[] = "subnet";
+constexpr char NVS_UDP_IN_PORT_KEY[] = "udp_in";
+constexpr char NVS_UDP_OUT_PORT_KEY[] = "udp_out";
+constexpr char NVS_UDP_OUT_IP_KEY[] = "udp_out_ip";
 
 constexpr uint8_t DEFAULT_DEVICE_ID = 1;
 constexpr uint32_t DEFAULT_HOMING_SPEED = 1000;
@@ -59,6 +70,8 @@ constexpr uint32_t DEFAULT_ACCELERATION = 1000;
 constexpr uint32_t DEFAULT_DECELERATION = 1000;
 constexpr uint32_t DEFAULT_P1_DELAY_MS = 1000;
 constexpr uint32_t DEFAULT_P2_DELAY_MS = 1000;
+constexpr uint16_t DEFAULT_UDP_IN_PORT = 8000;
+constexpr uint16_t DEFAULT_UDP_OUT_PORT = 8001;
 
 constexpr uint32_t STEPS_PER_REVOLUTION = 6400;
 constexpr uint32_t LEAD_SCREW_LEAD_MM = 4;
@@ -101,9 +114,18 @@ uint32_t acceleration = DEFAULT_ACCELERATION; // Master steps per second squared
 uint32_t deceleration = DEFAULT_DECELERATION; // Master steps per second squared.
 uint32_t p1_delay_ms = DEFAULT_P1_DELAY_MS;
 uint32_t p2_delay_ms = DEFAULT_P2_DELAY_MS;
+IPAddress device_ip(192, 168, 1, 100);
+IPAddress gateway_ip(192, 168, 1, 1);
+IPAddress subnet_mask(255, 255, 255, 0);
+IPAddress udp_out_ip(192, 168, 1, 101);
+uint16_t udp_in_port = DEFAULT_UDP_IN_PORT;
+uint16_t udp_out_port = DEFAULT_UDP_OUT_PORT;
 bool preferences_ready = false;
+bool ethernet_initialized = false;
+bool udp_initialized = false;
 
-// Working modes: 0 Home, 1 Manual (Bluetooth), 2 Auto (looping through a sequence of positions), 3 Jog (Bluetooth)
+// Working modes: 0 Standby/P1, 1 OSC position control, 2 Automatic P1/P2,
+// 3 Bluetooth Jog.
 
 int32_t motor_1_position = 0;
 int32_t motor_2_position = 0;
@@ -199,6 +221,8 @@ void startAutoMove(int32_t motor_1_target, int32_t motor_2_target,
 void startHoming();
 void monitorMovementLimitSwitches();
 void updateDelayedRehoming();
+bool initializeEthernet();
+bool initializeUDP();
 
 
 // BLUETOOTH SERIAL FUNCTIONS
@@ -213,6 +237,16 @@ void sendConfiguration() {
   SerialBT.println("DECELERATION=" + String(deceleration) + " steps/s^2");
   SerialBT.println("P1_DELAY=" + String(p1_delay_ms) + " ms");
   SerialBT.println("P2_DELAY=" + String(p2_delay_ms) + " ms");
+  SerialBT.println("DEVICE_IP=" + device_ip.toString());
+  SerialBT.println("GATEWAY=" + gateway_ip.toString());
+  SerialBT.println("SUBNET=" + subnet_mask.toString());
+  SerialBT.println("UDP_IN_PORT=" + String(udp_in_port));
+  SerialBT.println("UDP_OUT_IP=" + udp_out_ip.toString());
+  SerialBT.println("UDP_OUT_PORT=" + String(udp_out_port));
+  SerialBT.println("ETHERNET_INITIALIZED=" +
+                   String(ethernet_initialized ? "YES" : "NO"));
+  SerialBT.println("UDP_INITIALIZED=" +
+                   String(udp_initialized ? "YES" : "NO"));
   SerialBT.println("MOTOR_1_POSITION=" + String(motor_1_position));
   SerialBT.println("MOTOR_2_POSITION=" + String(motor_2_position));
   SerialBT.println("P1=" + String(p1_saved ? "SET" : "NOT_SET") +
@@ -244,6 +278,52 @@ bool parseUnsignedValue(const String &text, uint32_t &value) {
 
   value = parsed_value;
   return true;
+}
+
+bool parseIPv4Address(const String &text, IPAddress &address) {
+  IPAddress parsed_address;
+  if (!parsed_address.fromString(text)) {
+    return false;
+  }
+  address = parsed_address;
+  return true;
+}
+
+bool isValidHostAddress(const IPAddress &address) {
+  return address[0] >= 1 && address[0] <= 223 && address[0] != 127 &&
+         address[3] >= 1 && address[3] <= 254;
+}
+
+bool isValidSubnetMask(const IPAddress &mask) {
+  bool zero_seen = false;
+  bool one_seen = false;
+
+  for (uint8_t octet_index = 0; octet_index < 4; ++octet_index) {
+    const uint8_t octet = mask[octet_index];
+    for (int8_t bit_index = 7; bit_index >= 0; --bit_index) {
+      const bool bit_is_one = (octet & (1U << bit_index)) != 0;
+      if (bit_is_one) {
+        if (zero_seen) {
+          return false;
+        }
+        one_seen = true;
+      } else {
+        zero_seen = true;
+      }
+    }
+  }
+
+  return one_seen && zero_seen;
+}
+
+bool saveIPAddress(const char *key, const IPAddress &address) {
+  const uint32_t raw_address = static_cast<uint32_t>(address);
+  return preferences_ready &&
+         pref.putUInt(key, raw_address) == sizeof(raw_address);
+}
+
+bool saveUDPPort(const char *key, uint16_t port) {
+  return preferences_ready && pref.putUShort(key, port) == sizeof(port);
 }
 
 bool saveDeviceId(uint8_t value) {
@@ -400,9 +480,78 @@ void processData(String data) {
   parameter.trim();
   value_text.trim();
 
+  const bool is_device_ip = parameter.equalsIgnoreCase("DEVICE_IP");
+  const bool is_gateway = parameter.equalsIgnoreCase("GATEWAY");
+  const bool is_subnet = parameter.equalsIgnoreCase("SUBNET");
+  const bool is_udp_out_ip = parameter.equalsIgnoreCase("UDP_OUT_IP");
+  if (is_device_ip || is_gateway || is_subnet || is_udp_out_ip) {
+    IPAddress parsed_address;
+    if (!parseIPv4Address(value_text, parsed_address)) {
+      SerialBT.println("ERROR: Invalid IPv4 address");
+      return;
+    }
+    if (is_subnet ? !isValidSubnetMask(parsed_address)
+                  : !isValidHostAddress(parsed_address)) {
+      SerialBT.println(is_subnet ? "ERROR: Invalid subnet mask"
+                                 : "ERROR: Invalid host IPv4 address");
+      return;
+    }
+
+    IPAddress *configured_address = nullptr;
+    const char *nvs_key = nullptr;
+    if (is_device_ip) {
+      configured_address = &device_ip;
+      nvs_key = NVS_DEVICE_IP_KEY;
+    } else if (is_gateway) {
+      configured_address = &gateway_ip;
+      nvs_key = NVS_GATEWAY_KEY;
+    } else if (is_subnet) {
+      configured_address = &subnet_mask;
+      nvs_key = NVS_SUBNET_KEY;
+    } else {
+      configured_address = &udp_out_ip;
+      nvs_key = NVS_UDP_OUT_IP_KEY;
+    }
+
+    if (!(*configured_address == parsed_address) &&
+        !saveIPAddress(nvs_key, parsed_address)) {
+      SerialBT.println("ERROR: Failed to save network address to NVS");
+      return;
+    }
+    *configured_address = parsed_address;
+    SerialBT.println("OK: " + parameter + "=" + parsed_address.toString() +
+                     " (applies after restart)");
+    return;
+  }
+
   uint32_t value = 0;
   if (!parseUnsignedValue(value_text, value)) {
     SerialBT.println("ERROR: Value must be an unsigned integer");
+    return;
+  }
+
+  if (parameter.equalsIgnoreCase("UDP_IN_PORT") ||
+      parameter.equalsIgnoreCase("UDP_OUT_PORT")) {
+    if (value == 0 || value > UINT16_MAX) {
+      SerialBT.println("ERROR: UDP port range is 1-65535");
+      return;
+    }
+
+    uint16_t *configured_port = parameter.equalsIgnoreCase("UDP_IN_PORT")
+                                    ? &udp_in_port
+                                    : &udp_out_port;
+    const char *nvs_key = parameter.equalsIgnoreCase("UDP_IN_PORT")
+                              ? NVS_UDP_IN_PORT_KEY
+                              : NVS_UDP_OUT_PORT_KEY;
+    const uint16_t parsed_port = static_cast<uint16_t>(value);
+    if (*configured_port != parsed_port &&
+        !saveUDPPort(nvs_key, parsed_port)) {
+      SerialBT.println("ERROR: Failed to save UDP port to NVS");
+      return;
+    }
+    *configured_port = parsed_port;
+    SerialBT.println("OK: " + parameter + "=" + String(parsed_port) +
+                     " (applies after restart)");
     return;
   }
 
@@ -619,6 +768,18 @@ void initializeParameters() {
   motor_2_p2 = pref.getInt(NVS_MOTOR_2_P2_KEY, 0);
   p1_saved = pref.getBool(NVS_P1_SAVED_KEY, false);
   p2_saved = pref.getBool(NVS_P2_SAVED_KEY, false);
+  device_ip = IPAddress(pref.getUInt(
+      NVS_DEVICE_IP_KEY, static_cast<uint32_t>(device_ip)));
+  gateway_ip = IPAddress(pref.getUInt(
+      NVS_GATEWAY_KEY, static_cast<uint32_t>(gateway_ip)));
+  subnet_mask = IPAddress(pref.getUInt(
+      NVS_SUBNET_KEY, static_cast<uint32_t>(subnet_mask)));
+  udp_out_ip = IPAddress(pref.getUInt(
+      NVS_UDP_OUT_IP_KEY, static_cast<uint32_t>(udp_out_ip)));
+  udp_in_port =
+      pref.getUShort(NVS_UDP_IN_PORT_KEY, DEFAULT_UDP_IN_PORT);
+  udp_out_port =
+      pref.getUShort(NVS_UDP_OUT_PORT_KEY, DEFAULT_UDP_OUT_PORT);
 
   if (device_id < MIN_DEVICE_ID || device_id > MAX_DEVICE_ID) {
     device_id = DEFAULT_DEVICE_ID;
@@ -684,7 +845,102 @@ void initializeParameters() {
     }
   }
 
+  const IPAddress default_device_ip(192, 168, 1, 100);
+  const IPAddress default_gateway_ip(192, 168, 1, 1);
+  const IPAddress default_subnet_mask(255, 255, 255, 0);
+  const IPAddress default_udp_out_ip(192, 168, 1, 101);
+
+  if (!isValidHostAddress(device_ip)) {
+    device_ip = default_device_ip;
+    if (!saveIPAddress(NVS_DEVICE_IP_KEY, device_ip)) {
+      Serial.println("CRITICAL: Failed to repair DEVICE_IP in NVS.");
+    }
+  }
+
+  if (!isValidHostAddress(gateway_ip)) {
+    gateway_ip = default_gateway_ip;
+    if (!saveIPAddress(NVS_GATEWAY_KEY, gateway_ip)) {
+      Serial.println("CRITICAL: Failed to repair GATEWAY in NVS.");
+    }
+  }
+
+  if (!isValidSubnetMask(subnet_mask)) {
+    subnet_mask = default_subnet_mask;
+    if (!saveIPAddress(NVS_SUBNET_KEY, subnet_mask)) {
+      Serial.println("CRITICAL: Failed to repair SUBNET in NVS.");
+    }
+  }
+
+  if (!isValidHostAddress(udp_out_ip)) {
+    udp_out_ip = default_udp_out_ip;
+    if (!saveIPAddress(NVS_UDP_OUT_IP_KEY, udp_out_ip)) {
+      Serial.println("CRITICAL: Failed to repair UDP_OUT_IP in NVS.");
+    }
+  }
+
+  if (udp_in_port == 0) {
+    udp_in_port = DEFAULT_UDP_IN_PORT;
+    if (!saveUDPPort(NVS_UDP_IN_PORT_KEY, udp_in_port)) {
+      Serial.println("CRITICAL: Failed to repair UDP_IN_PORT in NVS.");
+    }
+  }
+
+  if (udp_out_port == 0) {
+    udp_out_port = DEFAULT_UDP_OUT_PORT;
+    if (!saveUDPPort(NVS_UDP_OUT_PORT_KEY, udp_out_port)) {
+      Serial.println("CRITICAL: Failed to repair UDP_OUT_PORT in NVS.");
+    }
+  }
+
   DEBUG_PRINTLN("Parameters loaded from NVS.");
+}
+
+// ETHERNET FUNCTIONS
+
+bool initializeUDP() {
+  osc_udp.stop();
+  udp_initialized = osc_udp.begin(device_ip, udp_in_port) == 1;
+  if (!udp_initialized) {
+    Serial.println("CRITICAL: Failed to initialize the UDP listener.");
+    return false;
+  }
+
+  DEBUG_PRINT("UDP listener initialized on ");
+  DEBUG_PRINT(device_ip.toString());
+  DEBUG_PRINT(":");
+  DEBUG_PRINTLN(udp_in_port);
+  return true;
+}
+
+bool initializeEthernet() {
+  ethernet_initialized = false;
+  udp_initialized = false;
+
+  if (!ETH.begin(ETH_ADDR, ETH_POWER_PIN, ETH_MDC_PIN, ETH_MDIO_PIN,
+                 ETH_TYPE, ETH_CLK_MODE_0)) {
+    Serial.println("CRITICAL: Failed to initialize Ethernet hardware.");
+    return false;
+  }
+
+  if (!ETH.config(device_ip, gateway_ip, subnet_mask)) {
+    Serial.println("CRITICAL: Failed to apply the Ethernet static IP.");
+    return false;
+  }
+
+  ethernet_initialized = true;
+  DEBUG_PRINTLN("Ethernet initialized.");
+  DEBUG_PRINT("  IP: ");
+  DEBUG_PRINTLN(device_ip.toString());
+  DEBUG_PRINT("  Gateway: ");
+  DEBUG_PRINTLN(gateway_ip.toString());
+  DEBUG_PRINT("  Subnet: ");
+  DEBUG_PRINTLN(subnet_mask.toString());
+  DEBUG_PRINT("  OSC destination: ");
+  DEBUG_PRINT(udp_out_ip.toString());
+  DEBUG_PRINT(":");
+  DEBUG_PRINTLN(udp_out_port);
+
+  return initializeUDP();
 }
 
 // HOMING FUNCTIONS
@@ -1497,6 +1753,8 @@ void setup() {
     // Critical errors are printed regardless of the DEBUG setting.
     Serial.println("Bluetooth Serial initialization failed");
   }
+
+  initializeEthernet();
 
   startHoming();
 }

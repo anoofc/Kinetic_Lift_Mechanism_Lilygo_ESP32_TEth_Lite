@@ -23,6 +23,9 @@
 #include <ETH.h>
 #include <WiFiUdp.h>
 #include <OSCMessage.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
 #include "eth_properties.h"
 
 #if DEBUG
@@ -73,6 +76,10 @@ constexpr uint32_t DEFAULT_P2_DELAY_MS = 1000;
 constexpr uint16_t DEFAULT_UDP_IN_PORT = 8000;
 constexpr uint16_t DEFAULT_UDP_OUT_PORT = 8001;
 constexpr int MAX_OSC_PACKET_SIZE = 256;
+constexpr uint8_t OSC_COMMAND_QUEUE_LENGTH = 8;
+constexpr uint32_t ETHERNET_TASK_STACK_SIZE = 6144;
+constexpr UBaseType_t ETHERNET_TASK_PRIORITY = 1;
+constexpr BaseType_t ETHERNET_TASK_CORE = 0;
 
 constexpr uint32_t STEPS_PER_REVOLUTION = 6400;
 constexpr uint32_t LEAD_SCREW_LEAD_MM = 4;
@@ -122,8 +129,17 @@ IPAddress udp_out_ip(192, 168, 1, 101);
 uint16_t udp_in_port = DEFAULT_UDP_IN_PORT;
 uint16_t udp_out_port = DEFAULT_UDP_OUT_PORT;
 bool preferences_ready = false;
-bool ethernet_initialized = false;
-bool udp_initialized = false;
+volatile bool ethernet_initialized = false;
+volatile bool udp_initialized = false;
+
+enum class OSCCommand : uint8_t {
+  MOVE_P1,
+  MOVE_P2,
+  RESTART
+};
+
+QueueHandle_t osc_command_queue = nullptr;
+volatile bool osc_command_pending = false;
 
 // Working modes: 0 Standby/P1, 1 OSC position control, 2 Automatic P1/P2,
 // 3 Bluetooth Jog.
@@ -224,8 +240,11 @@ void monitorMovementLimitSwitches();
 void updateDelayedRehoming();
 bool initializeEthernet();
 bool initializeUDP();
+bool startEthernetTask();
+void ethernetTask(void *parameter);
 void readOSC();
 void processOSCMessage(OSCMessage &message);
+void processPendingOSCCommand();
 
 
 // BLUETOOTH SERIAL FUNCTIONS
@@ -968,43 +987,33 @@ void processOSCMessage(OSCMessage &message) {
   DEBUG_PRINT("OSC received: ");
   DEBUG_PRINTLN(osc_address);
 
-  // Restart is an administrative command and remains available in every mode.
+  OSCCommand command;
   if (osc_address == restart_address) {
-    DEBUG_PRINTLN("Device-addressed OSC restart requested.");
-    stopJog();
-    stopAutoMode();
-    digitalWrite(MOTOR_1_PUL, LOW);
-    digitalWrite(MOTOR_2_PUL, LOW);
-    ESP.restart();
-    return;
+    command = OSCCommand::RESTART;
+  } else {
+    const String trigger_prefix = "/trigger" + addressed_device + "/";
+    if (!osc_address.startsWith(trigger_prefix)) {
+      return;
+    }
+
+    const String position = osc_address.substring(trigger_prefix.length());
+    if (position == "p1") {
+      command = OSCCommand::MOVE_P1;
+    } else if (position == "p2") {
+      command = OSCCommand::MOVE_P2;
+    } else {
+      DEBUG_PRINTLN("Unknown OSC position trigger ignored.");
+      return;
+    }
   }
 
-  const String trigger_prefix = "/trigger" + addressed_device + "/";
-  if (!osc_address.startsWith(trigger_prefix)) {
-    return;
+  if (osc_command_queue == nullptr ||
+      xQueueSend(osc_command_queue, &command, 0) != pdPASS) {
+    DEBUG_PRINTLN("OSC command queue full; command ignored.");
+  } else {
+    // The motor core checks this inexpensive flag before touching the queue.
+    osc_command_pending = true;
   }
-
-  if (working_mode != 1) {
-    DEBUG_PRINTLN("OSC position trigger ignored outside working mode 1.");
-    return;
-  }
-
-  const String position = osc_address.substring(trigger_prefix.length());
-  const bool target_is_p1 = position == "p1";
-  const bool target_is_p2 = position == "p2";
-  if (!target_is_p1 && !target_is_p2) {
-    DEBUG_PRINTLN("Unknown OSC position trigger ignored.");
-    return;
-  }
-
-  if (!startSavedPositionMove(target_is_p1)) {
-    DEBUG_PRINTLN(
-        "OSC trigger ignored: homing incomplete or position not calibrated.");
-    return;
-  }
-
-  DEBUG_PRINT("OSC moving to ");
-  DEBUG_PRINTLN(target_is_p1 ? "P1" : "P2");
 }
 
 void readOSC() {
@@ -1042,6 +1051,85 @@ void readOSC() {
   }
 
   processOSCMessage(message);
+}
+
+void ethernetTask(void *parameter) {
+  (void)parameter;
+  DEBUG_PRINT("Ethernet/OSC task running on core ");
+  DEBUG_PRINTLN(xPortGetCoreID());
+
+  if (!initializeEthernet()) {
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  for (;;) {
+    readOSC();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+bool startEthernetTask() {
+  osc_command_queue =
+      xQueueCreate(OSC_COMMAND_QUEUE_LENGTH, sizeof(OSCCommand));
+  if (osc_command_queue == nullptr) {
+    Serial.println("CRITICAL: Failed to create the OSC command queue.");
+    return false;
+  }
+
+  if (xTaskCreatePinnedToCore(ethernetTask, "ethernet_osc",
+                             ETHERNET_TASK_STACK_SIZE, nullptr,
+                             ETHERNET_TASK_PRIORITY, nullptr,
+                             ETHERNET_TASK_CORE) != pdPASS) {
+    Serial.println("CRITICAL: Failed to create the Ethernet/OSC task.");
+    vQueueDelete(osc_command_queue);
+    osc_command_queue = nullptr;
+    return false;
+  }
+
+  return true;
+}
+
+void processPendingOSCCommand() {
+  if (!osc_command_pending || osc_command_queue == nullptr) {
+    return;
+  }
+
+  // Clear first so a command queued concurrently on Core 0 sets it again.
+  osc_command_pending = false;
+  OSCCommand command;
+  if (xQueueReceive(osc_command_queue, &command, 0) != pdPASS) {
+    return;
+  }
+
+  if (uxQueueMessagesWaiting(osc_command_queue) > 0) {
+    osc_command_pending = true;
+  }
+
+  if (command == OSCCommand::RESTART) {
+    DEBUG_PRINTLN("Device-addressed OSC restart requested.");
+    stopJog();
+    stopAutoMode();
+    digitalWrite(MOTOR_1_PUL, LOW);
+    digitalWrite(MOTOR_2_PUL, LOW);
+    ESP.restart();
+    return;
+  }
+
+  if (working_mode != 1) {
+    DEBUG_PRINTLN("OSC position trigger ignored outside working mode 1.");
+    return;
+  }
+
+  const bool target_is_p1 = command == OSCCommand::MOVE_P1;
+  if (!startSavedPositionMove(target_is_p1)) {
+    DEBUG_PRINTLN(
+        "OSC trigger ignored: homing incomplete or position not calibrated.");
+    return;
+  }
+
+  DEBUG_PRINT("OSC moving to ");
+  DEBUG_PRINTLN(target_is_p1 ? "P1" : "P2");
 }
 
 // HOMING FUNCTIONS
@@ -1855,7 +1943,7 @@ void setup() {
     Serial.println("Bluetooth Serial initialization failed");
   }
 
-  initializeEthernet();
+  startEthernetTask();
 
   startHoming();
 }
@@ -1869,6 +1957,6 @@ void loop() {
     updateAutoMode();
     updateJog();
   }
-  readOSC();
+  processPendingOSCCommand();
   readBTSerial();
 }

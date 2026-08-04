@@ -78,8 +78,8 @@ On every power-up, the firmware:
 1. Initializes all GPIO with the pulse and direction outputs LOW.
 2. Loads saved parameters and calibrated positions from ESP32 NVS.
 3. Starts Bluetooth Classic Serial using `KINETIC_LIFT_<DEVICE_ID>`.
-4. Initializes Ethernet with the saved static network configuration and opens
-   the UDP input port.
+4. Starts a Core 0 task that initializes Ethernet with the saved static network
+   configuration and opens the UDP input port.
 5. Starts non-blocking homing for both motors.
 6. Sets both live motor-position counters to zero after both switches are reached.
 7. Immediately performs a coordinated move to the saved P1 coordinates.
@@ -236,8 +236,15 @@ For example, device ID `1` responds to:
 
 Position triggers for other device IDs are ignored. They are also ignored
 outside working mode `1`, before homing has completed, or when the requested
-position has not been calibrated. OSC processing is non-blocking and motor-step
-updates run before checking for a new UDP packet.
+position has not been calibrated.
+
+Ethernet initialization, UDP polling, and OSC decoding run in a dedicated
+FreeRTOS task pinned to ESP32 Core 0. The Arduino motor loop remains on Core 1.
+Decoded OSC actions cross to the motor core through a small FreeRTOS queue, so
+the network task never changes motor state or GPIO directly. The motor loop
+checks a lightweight pending flag and touches the queue only after a command has
+actually arrived. It handles at most one queued OSC action per pass without
+waiting.
 
 The separate device-addressed restart command is:
 
